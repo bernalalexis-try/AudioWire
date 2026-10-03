@@ -1,15 +1,18 @@
-# Clave de firma del APK: no se publica
+pc/AudioWire.exe
+pc/*.o
+linux/audiowire
+android/AudioWire.apk
+android/*.idsig
+android/*.keystore
+android/android-34.jar
+android/build_apk/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+.idea/
+*.iml
+
+# Claves de firma en cualquier carpeta
 *.keystore
 *.jks
-
-# Binarios compilados (se publican en Releases)
-*.exe
-*.apk
-*.o
-
-# Archivos de compilación
-android/build_apk/
-android/android-34.jar
-android/.gradle/
-android/app/build/
-android/build/

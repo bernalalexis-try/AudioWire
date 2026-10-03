@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compilar EXE (MinGW)
+      - name: Compilar EXE
         working-directory: pc
         run: |
           sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
@@ -37,3 +37,17 @@ jobs:
         with:
           name: AudioWire-windows
           path: pc/AudioWire.exe
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilar Linux
+        working-directory: linux
+        run: |
+          sudo apt-get update && sudo apt-get install -y libgtk-3-dev libpulse-dev
+          make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioWire-linux
+          path: linux/audiowire

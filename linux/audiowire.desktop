@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AudioWire
+Comment=Envía el audio del PC al móvil
+Exec=audiowire
+Icon=audiowire
+Terminal=false
+Categories=AudioVideo;Audio;Network;
