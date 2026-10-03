@@ -1,0 +1,39 @@
+name: Compilar AudioWire
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Compilar APK
+        working-directory: android
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioWire-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+  exe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilar EXE (MinGW)
+        working-directory: pc
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+          sh compilar.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioWire-windows
+          path: pc/AudioWire.exe

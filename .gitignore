@@ -1,0 +1,15 @@
+# Clave de firma del APK: no se publica
+*.keystore
+*.jks
+
+# Binarios compilados (se publican en Releases)
+*.exe
+*.apk
+*.o
+
+# Archivos de compilación
+android/build_apk/
+android/android-34.jar
+android/.gradle/
+android/app/build/
+android/build/
