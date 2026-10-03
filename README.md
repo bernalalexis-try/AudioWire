@@ -4,35 +4,39 @@
 
 # AudioWire
 
-Envía el audio de tu PC con Windows o Linux a tu móvil Android por Wi-Fi.
+English · **[Español](README.es.md)**
 
-[![Descargar para Windows](https://img.shields.io/badge/Windows-Descargar_.exe-F0651E?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/bernalalexis-try/AudioWire/releases/latest/download/AudioWire.exe)
-[![Descargar para Linux](https://img.shields.io/badge/Linux-Descargar-F0651E?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/bernalalexis-try/AudioWire/releases/latest/download/audiowire)
-[![Descargar para Android](https://img.shields.io/badge/Android-Descargar_.apk-F0651E?style=for-the-badge&logo=android&logoColor=white)](https://github.com/bernalalexis-try/AudioWire/releases/latest/download/AudioWire.apk)
+Stream the audio from your Windows or Linux PC to your Android phone over Wi-Fi.
 
-<img src="docs/captura.png" width="396" alt="AudioWire en Windows transmitiendo a un móvil">
+[![Download for Windows](https://img.shields.io/badge/Windows-Download_.exe-F0651E?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/bernalalexis-try/AudioWire/releases/latest/download/AudioWire.exe)
+[![Download for Linux](https://img.shields.io/badge/Linux-Download-F0651E?style=for-the-badge&logo=linux&logoColor=white)](https://github.com/bernalalexis-try/AudioWire/releases/latest/download/audiowire)
+[![Download for Android](https://img.shields.io/badge/Android-Download_.apk-F0651E?style=for-the-badge&logo=android&logoColor=white)](https://github.com/bernalalexis-try/AudioWire/releases/latest/download/AudioWire.apk)
+
+<img src="docs/captura.png" width="396" alt="AudioWire on Windows streaming to a phone">
 
 </div>
 
-## Uso
+## Usage
 
-1. Abre AudioWire en el PC.
-   - **Windows:** cuando pregunte por el firewall, permite **redes privadas**.
-   - **Linux:** dale permiso de ejecución con `chmod +x audiowire` y ábrelo.
-2. Instala el APK en el móvil (acepta "orígenes desconocidos").
-3. Escribe en el móvil la IP que muestra el PC y pulsa **Conectar**.
+1. Open AudioWire on your PC.
+   - **Windows:** when the firewall prompt appears, allow **private networks**.
+   - **Linux:** make it executable with `chmod +x audiowire` and open it.
+2. Install the APK on your phone (allow "unknown sources").
+3. On your phone, enter the IP address shown on the PC and tap **Conectar** (Connect).
 
-Si se corta, el móvil se reconecta solo.
+If the connection drops, the phone reconnects on its own.
 
-## Requisitos
+> The app interface is currently in Spanish.
 
-- PC con Windows, o con Linux con GTK 3 y PulseAudio o PipeWire (Ubuntu 22.04, Debian 12, Fedora 35 o más nuevos).
-- Móvil con Android 7.0 o superior.
-- Los dos conectados a la misma red Wi-Fi.
-- El puerto TCP 5005 permitido en el firewall del PC.
+## Requirements
 
-## Estructura
+- A Windows PC, or a Linux PC with GTK 3 and PulseAudio or PipeWire (Ubuntu 22.04, Debian 12, Fedora 35 or newer).
+- An Android 7.0 or newer phone.
+- Both devices on the same Wi-Fi network.
+- TCP port 5005 allowed through the PC's firewall.
 
-- `pc/` → app de Windows en C nativo (Win32 + WASAPI), un solo `.exe` sin dependencias.
-- `linux/` → app de Linux en C (GTK 3 + PulseAudio/PipeWire).
-- `android/` → app del móvil, que reproduce el audio.
+## Project structure
+
+- `pc/` → Windows app in native C (Win32 + WASAPI), a single `.exe` with no dependencies.
+- `linux/` → Linux app in C (GTK 3 + PulseAudio/PipeWire).
+- `android/` → phone app, which plays the audio.
