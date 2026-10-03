@@ -31,10 +31,3 @@ Si se corta, el móvil se reconecta solo.
 
 - `pc/` → app de Windows en C nativo (Win32 + WASAPI), un solo `.exe` sin dependencias.
 - `android/` → app del móvil, que reproduce el audio.
-
-## Compilar
-
-- **Windows:** `sh pc/compilar.sh` (necesita MinGW: `gcc-mingw-w64-x86-64`).
-- **Android:** `gradle assembleDebug` dentro de `android/`, o `sh android/compilar_apk.sh`.
-
-Cada push compila los dos automáticamente con GitHub Actions.
