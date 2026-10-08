@@ -4,7 +4,6 @@
 #include <pulse/error.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <pthread.h>
 #include <signal.h>
@@ -44,9 +43,15 @@
 #define COL_MARCA  0xcdc4ba
 #define COL_SOMBRA 0xece4da
 
+#define MAX_DATOS 1200
+#define CADUCIDAD 3500
+
 static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
-static int clientes[MAX_CLIENTES];
+typedef struct { struct sockaddr_in dir; long long visto; } Cliente;
+static Cliente clientes[MAX_CLIENTES];
 static int nclientes = 0;
+static int g_sock = -1;
+static uint32_t g_seq = 0;
 static atomic_int g_vol = 100;
 static atomic_llong g_ultimoSonido = 0;
 static char g_sink[256] = "";
@@ -61,57 +66,88 @@ static long long ahora_ms(void) {
     return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
-static int enviar_todo(int s, const void *p, size_t n) {
-    const char *c = p;
-    while (n > 0) {
-        ssize_t r = send(s, c, n, MSG_NOSIGNAL);
-        if (r <= 0) return 0;
-        c += r;
-        n -= (size_t)r;
+static void purgar(long long ahora) {
+    for (int i = 0; i < nclientes;) {
+        if (ahora - clientes[i].visto > CADUCIDAD) clientes[i] = clientes[--nclientes];
+        else i++;
     }
-    return 1;
 }
 
-static void enviar(const void *datos, size_t n, int sonido) {
+static int buscar(const struct sockaddr_in *d) {
+    for (int i = 0; i < nclientes; i++)
+        if (clientes[i].dir.sin_addr.s_addr == d->sin_addr.s_addr && clientes[i].dir.sin_port == d->sin_port) return i;
+    return -1;
+}
+
+static void poner32(unsigned char *p, uint32_t v) {
+    p[0] = v & 255; p[1] = (v >> 8) & 255; p[2] = (v >> 16) & 255; p[3] = (v >> 24) & 255;
+}
+
+static void enviar(const int16_t *pcm, int frames, int sonido) {
     pthread_mutex_lock(&mx);
-    if (nclientes && sonido) g_ultimoSonido = ahora_ms();
-    for (int i = 0; i < nclientes;) {
-        if (!enviar_todo(clientes[i], datos, n)) {
-            close(clientes[i]);
-            clientes[i] = clientes[--nclientes];
-        } else i++;
+    long long ahora = ahora_ms();
+    purgar(ahora);
+    if (nclientes && g_sock >= 0) {
+        if (sonido) g_ultimoSonido = ahora;
+        int maxF = MAX_DATOS / (CANALES * 2);
+        unsigned char paq[12 + MAX_DATOS] = {'S', 'W', 'A', CANALES};
+        poner32(paq + 4, RATE);
+        for (int off = 0; off < frames; off += maxF) {
+            int f = frames - off < maxF ? frames - off : maxF;
+            poner32(paq + 8, g_seq++);
+            memcpy(paq + 12, pcm + (size_t)off * CANALES, (size_t)f * CANALES * 2);
+            for (int i = 0; i < nclientes; i++)
+                sendto(g_sock, paq, 12 + f * CANALES * 2, MSG_DONTWAIT, (struct sockaddr *)&clientes[i].dir,
+                       sizeof clientes[i].dir);
+        }
     }
     pthread_mutex_unlock(&mx);
 }
 
-static void *hilo_aceptar(void *arg) {
+static void *hilo_red(void *arg) {
     (void)arg;
-    int srv = socket(AF_INET, SOCK_STREAM, 0);
-    int uno = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &uno, sizeof uno);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_port = htons(PUERTO);
     a.sin_addr.s_addr = INADDR_ANY;
-    if (bind(srv, (struct sockaddr *)&a, sizeof a) || listen(srv, 5)) {
+    if (bind(s, (struct sockaddr *)&a, sizeof a)) {
         pthread_mutex_lock(&mx);
         snprintf(g_errRed, sizeof g_errRed, "Puerto %d ocupado", PUERTO);
         pthread_mutex_unlock(&mx);
         return NULL;
     }
+    int tam = 256 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &tam, sizeof tam);
+    g_sock = s;
     for (;;) {
-        int c = accept(srv, NULL, NULL);
-        if (c < 0) { usleep(100000); continue; }
-        struct timeval to = {2, 0};
-        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &uno, sizeof uno);
-        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof to);
-        unsigned char cab[10] = {'S', 'W', 'X', '1',
-                                 RATE & 255, (RATE >> 8) & 255, (RATE >> 16) & 255, (RATE >> 24) & 255,
-                                 CANALES & 255, (CANALES >> 8) & 255};
+        char b[64];
+        struct sockaddr_in de;
+        socklen_t l = sizeof de;
+        ssize_t n = recvfrom(s, b, sizeof b, 0, (struct sockaddr *)&de, &l);
+        if (n < 4 || b[0] != 'S' || b[1] != 'W' || b[2] != 'X') {
+            if (n < 0) usleep(10000);
+            continue;
+        }
         pthread_mutex_lock(&mx);
-        if (nclientes < MAX_CLIENTES && enviar_todo(c, cab, sizeof cab)) clientes[nclientes++] = c;
-        else close(c);
+        long long ahora = ahora_ms();
+        int i = buscar(&de);
+        if (b[3] == 'H') {
+            if (i >= 0) clientes[i].visto = ahora;
+            else if (nclientes < MAX_CLIENTES) {
+                clientes[nclientes].dir = de;
+                clientes[nclientes].visto = ahora;
+                nclientes++;
+            }
+            sendto(s, "SWXP", 4, MSG_DONTWAIT, (struct sockaddr *)&de, sizeof de);
+        } else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         pthread_mutex_unlock(&mx);
+        if (b[3] == 'D') {
+            char r[80] = "SWXI";
+            if (gethostname(r + 4, sizeof r - 5) != 0) snprintf(r + 4, sizeof r - 4, "PC");
+            r[sizeof r - 1] = 0;
+            sendto(s, r, strlen(r), MSG_DONTWAIT, (struct sockaddr *)&de, sizeof de);
+        }
     }
     return NULL;
 }
@@ -234,7 +270,7 @@ static void *hilo_captura(void *arg) {
                 float f = v * g;
                 buf[i] = (int16_t)(f > 32767.f ? 32767 : f < -32768.f ? -32768 : (int)f);
             }
-            enviar(buf, sizeof buf, sonido && g_vol > 0);
+            enviar(buf, BLOQUE, sonido && g_vol > 0);
             pthread_mutex_lock(&mx);
             int cambio = g_sinkGen != gen;
             pthread_mutex_unlock(&mx);
@@ -442,6 +478,7 @@ static void actualizar_estado(void) {
     } else snprintf(ip, sizeof ip, "%s", txtIP);
 
     pthread_mutex_lock(&mx);
+    purgar(ahora);
     int n = nclientes;
     int sonando = n > 0 && ahora - g_ultimoSonido < 1000;
     int errRed = g_errRed[0] != 0;
@@ -623,7 +660,7 @@ static void al_activar(GtkApplication *app, gpointer u) {
     }
 
     pthread_t t;
-    pthread_create(&t, NULL, hilo_aceptar, NULL);
+    pthread_create(&t, NULL, hilo_red, NULL);
     pthread_create(&t, NULL, hilo_info, NULL);
     pthread_create(&t, NULL, hilo_captura, NULL);
 

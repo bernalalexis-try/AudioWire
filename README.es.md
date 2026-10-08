@@ -22,7 +22,7 @@ Envía el audio de tu PC con Windows o Linux a tu móvil Android por Wi-Fi.
    - **Windows:** cuando pregunte por el firewall, permite **redes privadas**.
    - **Linux:** dale permiso de ejecución con `chmod +x audiowire` y ábrelo.
 2. Instala el APK en el móvil (acepta "orígenes desconocidos").
-3. Escribe en el móvil la IP que muestra el PC y pulsa **Conectar**.
+3. Abre la app en el móvil: encuentra el PC en la red y se conecta sola. Si no lo encuentra, escribe la IP que muestra el PC y pulsa **Conectar**.
 
 Si se corta, el móvil se reconecta solo.
 
@@ -31,7 +31,7 @@ Si se corta, el móvil se reconecta solo.
 - PC con Windows, o con Linux con GTK 3 y PulseAudio o PipeWire (Ubuntu 22.04, Debian 12, Fedora 35 o más nuevos).
 - Móvil con Android 7.0 o superior.
 - Los dos conectados a la misma red Wi-Fi.
-- El puerto TCP 5005 permitido en el firewall del PC.
+- El puerto UDP 5005 permitido en el firewall del PC.
 
 ## Estructura
 

@@ -17,13 +17,13 @@ import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.Process;
 
-import java.io.BufferedInputStream;
-import java.io.DataInputStream;
+import android.os.SystemClock;
+
 import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.Socket;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.SocketTimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class AudioService extends Service {
@@ -31,14 +31,16 @@ public class AudioService extends Service {
     public static final String EXTRA_IP = "ip";
     public static final int PUERTO = 5005;
     private static final String CANAL_ID = "audiowire";
-    private static final int MAX_RETRASO_MS = 120;
+    private static final int RETRASO_MS = 60;
+    private static final byte[] HOLA = {'S', 'W', 'X', 'H'};
+    private static final byte[] ADIOS = {'S', 'W', 'X', 'B'};
 
     public static volatile String estado = "Desconectado";
     public static volatile boolean activo = false;
+    public static volatile String nombrePc = null;
 
     private AtomicBoolean vivo;
     private Thread hilo;
-    private volatile Socket socket;
     private WifiManager.WifiLock wifiLock;
     private PowerManager.WakeLock wakeLock;
 
@@ -54,7 +56,8 @@ public class AudioService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
-        iniciarPrimerPlano(ip);
+        String quien = nombrePc != null ? nombrePc : ip;
+        iniciarPrimerPlano(quien);
         adquirirLocks();
         detenerHilo();
 
@@ -64,7 +67,7 @@ public class AudioService extends Service {
         hilo = new Thread(new Runnable() {
             @Override
             public void run() {
-                bucle(ip, flag);
+                bucle(ip, quien, flag);
             }
         }, "AudioWire");
         hilo.start();
@@ -83,13 +86,8 @@ public class AudioService extends Service {
 
     private void detenerHilo() {
         if (vivo != null) vivo.set(false);
-        Socket s = socket;
-        if (s != null) {
-            try { s.close(); } catch (IOException ignored) { }
-        }
         if (hilo != null) {
-            hilo.interrupt();
-            try { hilo.join(500); } catch (InterruptedException ignored) { }
+            try { hilo.join(800); } catch (InterruptedException ignored) { }
             hilo = null;
         }
     }
@@ -126,7 +124,7 @@ public class AudioService extends Service {
         PendingIntent pi = PendingIntent.getActivity(this, 0,
                 new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
         Notification n = b.setContentTitle("AudioWire")
-                .setContentText("Recibiendo audio de " + ip)
+                .setContentText("Conectado a " + ip)
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentIntent(pi)
                 .setOngoing(true)
@@ -138,44 +136,15 @@ public class AudioService extends Service {
         }
     }
 
-    private void bucle(String ip, AtomicBoolean vivo) {
-        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-        while (vivo.get()) {
-            Socket s = new Socket();
-            socket = s;
-            try {
-                estado = "Conectando a " + ip + "…";
-                s.setTcpNoDelay(true);
-                s.connect(new InetSocketAddress(ip, PUERTO), 3000);
-                DataInputStream entrada = new DataInputStream(new BufferedInputStream(s.getInputStream(), 32 * 1024));
-
-                byte[] cab = new byte[10];
-                entrada.readFully(cab);
-                if (cab[0] != 'S' || cab[1] != 'W' || cab[2] != 'X' || cab[3] != '1') {
-                    throw new IOException("servidor no compatible");
-                }
-                ByteBuffer bb = ByteBuffer.wrap(cab).order(ByteOrder.LITTLE_ENDIAN);
-                int rate = bb.getInt(4);
-                int canales = bb.getShort(8) & 0xFFFF;
-                reproducir(entrada, rate, canales, ip, vivo);
-            } catch (Exception e) {
-                if (!vivo.get()) break;
-                estado = "Sin conexión (" + (e.getMessage() != null ? e.getMessage() : "error") + "). Reintentando…";
-                try { Thread.sleep(1500); } catch (InterruptedException ie) { break; }
-            } finally {
-                try { s.close(); } catch (IOException ignored) { }
-                socket = null;
-            }
-        }
+    private static int leer32(byte[] b, int p) {
+        return (b[p] & 0xFF) | (b[p + 1] & 0xFF) << 8 | (b[p + 2] & 0xFF) << 16 | (b[p + 3] & 0xFF) << 24;
     }
 
-    private void reproducir(DataInputStream entrada, int rate, int canales, String ip, AtomicBoolean vivo)
-            throws IOException {
-        int canalesSalida = canales == 1 ? 1 : 2;
-        int mascara = canalesSalida == 1 ? AudioFormat.CHANNEL_OUT_MONO : AudioFormat.CHANNEL_OUT_STEREO;
+    private AudioTrack crearPista(int rate, int canales) {
+        int mascara = canales == 1 ? AudioFormat.CHANNEL_OUT_MONO : AudioFormat.CHANNEL_OUT_STEREO;
         int minBuf = AudioTrack.getMinBufferSize(rate, mascara, AudioFormat.ENCODING_PCM_16BIT);
-
-        AudioTrack.Builder builder = new AudioTrack.Builder()
+        int deseado = rate * canales * 2 * RETRASO_MS / 1000;
+        AudioTrack.Builder b = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -186,45 +155,113 @@ public class AudioService extends Service {
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                         .build())
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                .setBufferSizeInBytes(minBuf * 2);
-        if (Build.VERSION.SDK_INT >= 26) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
-        AudioTrack track = builder.build();
+                .setBufferSizeInBytes(Math.max(minBuf, deseado));
+        if (Build.VERSION.SDK_INT >= 26) b.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
+        AudioTrack t = b.build();
+        t.play();
+        return t;
+    }
 
-        int bytesFrameEntrada = canales * 2;
-        int bytesFrameSalida = canalesSalida * 2;
-        int framesBloque = rate / 100;
-        byte[] bufEntrada = new byte[framesBloque * bytesFrameEntrada];
-        byte[] bufSalida = canales > 2 ? new byte[framesBloque * bytesFrameSalida] : bufEntrada;
-        byte[] tmp = new byte[8192];
-        int maxRetraso = rate * bytesFrameEntrada / 1000 * MAX_RETRASO_MS;
-
-        track.play();
-        estado = "Reproduciendo desde " + ip + " · " + rate + " Hz";
+    private void bucle(String ip, String quien, AtomicBoolean vivo) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+        estado = "Conectando a " + quien + "…";
+        DatagramSocket s = null;
+        AudioTrack pista = null;
         try {
+            InetAddress dir = InetAddress.getByName(ip);
+            s = new DatagramSocket();
+            s.setSoTimeout(200);
+            DatagramPacket hola = new DatagramPacket(HOLA, HOLA.length, dir, PUERTO);
+            byte[] buf = new byte[2048];
+            byte[] silencio = new byte[2048];
+            DatagramPacket p = new DatagramPacket(buf, buf.length);
+
+            long ultimoHola = 0, ultimaRespuesta = 0, ultimoAudio = 0, ultimoEstado = 0;
+            int rate = 0, canales = 0, seqEsperado = 0, escritos = 0, capacidad = 0;
+            boolean haySeq = false;
+
             while (vivo.get()) {
-                entrada.readFully(bufEntrada);
-
-                int pendiente = entrada.available();
-                if (pendiente > maxRetraso) {
-                    int sobra = (pendiente - maxRetraso / 2) / bytesFrameEntrada * bytesFrameEntrada;
-                    int bloque = tmp.length / bytesFrameEntrada * bytesFrameEntrada;
-                    while (sobra > 0) {
-                        int n = Math.min(sobra, bloque);
-                        entrada.readFully(tmp, 0, n);
-                        sobra -= n;
-                    }
+                long ahora = SystemClock.elapsedRealtime();
+                if (ahora - ultimoHola >= 1000) {
+                    try { s.send(hola); } catch (IOException ignored) { }
+                    ultimoHola = ahora;
+                }
+                if (ahora - ultimoEstado >= 250) {
+                    ultimoEstado = ahora;
+                    if (ultimaRespuesta == 0) estado = "Conectando a " + quien + "…";
+                    else if (ahora - ultimaRespuesta > 3000) estado = "Sin respuesta de " + quien + ". Reintentando…";
+                    else if (ahora - ultimoAudio < 1000) estado = "Reproduciendo desde " + quien;
+                    else estado = "Conectado a " + quien + " · sin sonido";
                 }
 
-                if (canales > 2) {
-                    for (int f = 0; f < framesBloque; f++) {
-                        System.arraycopy(bufEntrada, f * bytesFrameEntrada, bufSalida, f * 4, 4);
+                p.setLength(buf.length);
+                try {
+                    s.receive(p);
+                } catch (SocketTimeoutException e) {
+                    continue;
+                } catch (IOException e) {
+                    try { Thread.sleep(200); } catch (InterruptedException ie) { break; }
+                    continue;
+                }
+                if (!dir.equals(p.getAddress())) continue;
+                int n = p.getLength();
+                if (n < 4 || buf[0] != 'S' || buf[1] != 'W') continue;
+                if (buf[2] == 'X' && buf[3] == 'P') {
+                    ultimaRespuesta = ahora;
+                    continue;
+                }
+                if (buf[2] != 'A' || n < 12) continue;
+
+                int ch = buf[3] & 0xFF, r = leer32(buf, 4), seq = leer32(buf, 8);
+                if (ch < 1 || ch > 2 || r < 8000 || r > 192000) continue;
+                ultimaRespuesta = ahora;
+                ultimoAudio = ahora;
+
+                if (pista == null || r != rate || ch != canales) {
+                    if (pista != null) pista.release();
+                    pista = crearPista(r, ch);
+                    capacidad = pista.getBufferSizeInFrames();
+                    rate = r;
+                    canales = ch;
+                    escritos = 0;
+                    haySeq = false;
+                }
+
+                int bytesFrame = canales * 2;
+                int frames = (n - 12) / bytesFrame;
+                if (haySeq) {
+                    int dif = seq - seqEsperado;
+                    if (dif < 0 && dif > -1000) continue;
+                    if (dif > 1000) haySeq = false;
+                }
+                int cola = escritos - pista.getPlaybackHeadPosition();
+                if (haySeq) {
+                    int perdidos = seq - seqEsperado;
+                    for (int k = 0; k < perdidos && k < 4 && cola + 2 * frames <= capacidad; k++) {
+                        pista.write(silencio, 0, frames * bytesFrame);
+                        escritos += frames;
+                        cola += frames;
                     }
                 }
-                track.write(bufSalida, 0, bufSalida.length);
+                seqEsperado = seq + 1;
+                haySeq = true;
+                if (cola + frames > capacidad) continue;
+                int w = pista.write(buf, 12, frames * bytesFrame);
+                if (w > 0) escritos += w / bytesFrame;
             }
+        } catch (Exception e) {
+            estado = "Error: " + (e.getMessage() != null ? e.getMessage() : "desconocido");
         } finally {
-            try { track.stop(); } catch (IllegalStateException ignored) { }
-            track.release();
+            if (s != null) {
+                try {
+                    s.send(new DatagramPacket(ADIOS, ADIOS.length, InetAddress.getByName(ip), PUERTO));
+                } catch (Exception ignored) { }
+                s.close();
+            }
+            if (pista != null) {
+                try { pista.stop(); } catch (IllegalStateException ignored) { }
+                pista.release();
+            }
         }
     }
 }

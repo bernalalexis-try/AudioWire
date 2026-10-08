@@ -5,7 +5,7 @@ B=build_apk; rm -rf $B; mkdir -p $B/obj
 [ -f android-34.jar ] || curl -sSL -o android-34.jar \
   https://raw.githubusercontent.com/Sable/android-platforms/master/android-34/android.jar
 
-sed 's|<manifest xmlns:android="http://schemas.android.com/apk/res/android">|<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.audiowire" android:versionCode="1" android:versionName="1.0">\n    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />|' \
+sed 's|<manifest xmlns:android="http://schemas.android.com/apk/res/android">|<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.audiowire" android:versionCode="4" android:versionName="2.2">\n    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />|' \
   app/src/main/AndroidManifest.xml > $B/AndroidManifest.xml
 
 javac -encoding UTF-8 -nowarn -Xlint:-options -source 8 -target 8 -bootclasspath android-34.jar -d $B/obj \

@@ -28,71 +28,102 @@ static const GUID G_SUB_PCM      = {0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xA
 static const PROPERTYKEY G_PKEY_Nombre = {{0xA45C254E,0xDF1C,0x4EFD,{0x80,0x20,0x67,0xD1,0x46,0xA8,0x50,0xE0}},14};
 
 static CRITICAL_SECTION cs;
-static SOCKET clientes[MAX_CLIENTES];
+typedef struct { struct sockaddr_in dir; ULONGLONG visto; } Cliente;
+static Cliente clientes[MAX_CLIENTES];
 static int nclientes = 0;
+static SOCKET g_sock = INVALID_SOCKET;
+static DWORD g_seq = 0;
 static volatile LONG g_rate = 0, g_canales = 0;
 static volatile ULONGLONG g_ultimoEnvio = 0;
 static wchar_t g_disp[256] = L"Iniciando…";
 static wchar_t g_errRed[128] = L"";
 static volatile LONG g_vol = 100;
 #define VOL_MAX 150
+#define MAX_DATOS 1200
+#define CADUCIDAD 3500
 
-static void cerrar_clientes(void) {
-    for (int i = 0; i < nclientes; i++) closesocket(clientes[i]);
-    nclientes = 0;
-}
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 
-static int enviar_todo(SOCKET s, const char *p, int n) {
-    while (n > 0) {
-        int r = send(s, p, n, 0);
-        if (r <= 0) return 0;
-        p += r; n -= r;
+static void purgar(ULONGLONG ahora) {
+    for (int i = 0; i < nclientes;) {
+        if (ahora - clientes[i].visto > CADUCIDAD) clientes[i] = clientes[--nclientes];
+        else i++;
     }
-    return 1;
 }
 
-static void enviar(const char *datos, int n, int conSonido) {
+static int buscar(const struct sockaddr_in *d) {
+    for (int i = 0; i < nclientes; i++)
+        if (clientes[i].dir.sin_addr.s_addr == d->sin_addr.s_addr && clientes[i].dir.sin_port == d->sin_port) return i;
+    return -1;
+}
+
+static void enviar(const short *pcm, int frames, int conSonido) {
     EnterCriticalSection(&cs);
-    if (nclientes && conSonido) g_ultimoEnvio = GetTickCount64();
-    for (int i = 0; i < nclientes; ) {
-        if (!enviar_todo(clientes[i], datos, n)) {
-            closesocket(clientes[i]);
-            clientes[i] = clientes[--nclientes];
-        } else i++;
+    ULONGLONG ahora = GetTickCount64();
+    purgar(ahora);
+    if (nclientes && g_sock != INVALID_SOCKET) {
+        if (conSonido) g_ultimoEnvio = ahora;
+        int ch = (int)g_canales, maxF = MAX_DATOS / (ch * 2);
+        DWORD rate = (DWORD)g_rate;
+        char paq[12 + MAX_DATOS];
+        paq[0] = 'S'; paq[1] = 'W'; paq[2] = 'A'; paq[3] = (char)ch;
+        memcpy(paq + 4, &rate, 4);
+        for (int off = 0; off < frames; off += maxF) {
+            int f = frames - off < maxF ? frames - off : maxF;
+            DWORD seq = g_seq++;
+            memcpy(paq + 8, &seq, 4);
+            memcpy(paq + 12, pcm + (size_t)off * ch, (size_t)f * ch * 2);
+            for (int i = 0; i < nclientes; i++)
+                sendto(g_sock, paq, 12 + f * ch * 2, 0, (struct sockaddr *)&clientes[i].dir, sizeof clientes[i].dir);
+        }
     }
     LeaveCriticalSection(&cs);
 }
 
-static DWORD WINAPI hilo_aceptar(LPVOID arg) {
+static DWORD WINAPI hilo_red(LPVOID arg) {
     (void)arg;
-    SOCKET srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     BOOL excl = TRUE;
-    setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char *)&excl, sizeof excl);
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (char *)&excl, sizeof excl);
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
     a.sin_port = htons(PUERTO);
     a.sin_addr.s_addr = INADDR_ANY;
-    if (bind(srv, (struct sockaddr *)&a, sizeof a) || listen(srv, 5)) {
+    if (bind(s, (struct sockaddr *)&a, sizeof a)) {
         EnterCriticalSection(&cs);
         swprintf(g_errRed, 128, L"Puerto %d ocupado", PUERTO);
         LeaveCriticalSection(&cs);
         return 0;
     }
-    for (;;) {
-        SOCKET c = accept(srv, NULL, NULL);
-        if (c == INVALID_SOCKET) { Sleep(100); continue; }
-        BOOL nd = TRUE; DWORD to = 2000;
-        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&nd, sizeof nd);
-        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (char *)&to, sizeof to);
-        while (g_rate == 0) Sleep(100);
+    BOOL no = FALSE; DWORD ret = 0;
+    WSAIoctl(s, SIO_UDP_CONNRESET, &no, sizeof no, NULL, 0, &ret, NULL, NULL);
+    int tam = 256 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&tam, sizeof tam);
+    g_sock = s;
 
+    for (;;) {
+        char b[64];
+        struct sockaddr_in de; int l = sizeof de;
+        int n = recvfrom(s, b, sizeof b, 0, (struct sockaddr *)&de, &l);
+        if (n < 4 || b[0] != 'S' || b[1] != 'W' || b[2] != 'X') { if (n < 0) Sleep(10); continue; }
         EnterCriticalSection(&cs);
-        unsigned char cab[10] = {'S', 'W', 'X', '1'};
-        DWORD r = (DWORD)g_rate; WORD ch = (WORD)g_canales;
-        memcpy(cab + 4, &r, 4); memcpy(cab + 8, &ch, 2);
-        if (nclientes < MAX_CLIENTES && enviar_todo(c, (char *)cab, 10)) clientes[nclientes++] = c;
-        else closesocket(c);
+        ULONGLONG ahora = GetTickCount64();
+        int i = buscar(&de);
+        if (b[3] == 'H') {
+            if (i >= 0) clientes[i].visto = ahora;
+            else if (nclientes < MAX_CLIENTES) { clientes[nclientes].dir = de; clientes[nclientes].visto = ahora; nclientes++; }
+            sendto(s, "SWXP", 4, 0, (struct sockaddr *)&de, sizeof de);
+        } else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         LeaveCriticalSection(&cs);
+        if (b[3] == 'D') {
+            char r[80] = "SWXI";
+            wchar_t nombre[MAX_COMPUTERNAME_LENGTH + 1]; DWORD tn = MAX_COMPUTERNAME_LENGTH + 1;
+            if (!GetComputerNameW(nombre, &tn)) wcscpy(nombre, L"PC");
+            int nb = WideCharToMultiByte(CP_UTF8, 0, nombre, -1, r + 4, sizeof r - 5, NULL, NULL);
+            sendto(s, r, nb > 0 ? 4 + nb - 1 : 4, 0, (struct sockaddr *)&de, sizeof de);
+        }
     }
 }
 
@@ -174,11 +205,10 @@ static DWORD WINAPI hilo_captura(LPVOID arg) {
         IAudioClient_GetBufferSize(ac, &tamBuf);
         if (FAILED(IAudioClient_GetService(ac, &G_IID_Capture, (void **)&cc))) { err = L"No se pudo iniciar la captura"; goto fin; }
 
-        int canales = wfx->nChannels;
+        int canales = wfx->nChannels, salida = canales > 2 ? 2 : canales;
         buf = (short *)malloc((size_t)tamBuf * canales * sizeof(short));
         EnterCriticalSection(&cs);
-        if ((LONG)wfx->nSamplesPerSec != g_rate || canales != g_canales) cerrar_clientes();
-        g_rate = (LONG)wfx->nSamplesPerSec; g_canales = canales;
+        g_rate = (LONG)wfx->nSamplesPerSec; g_canales = salida;
         LeaveCriticalSection(&cs);
 
         IAudioClient_Start(ac);
@@ -195,7 +225,12 @@ static DWORD WINAPI hilo_captura(LPVOID arg) {
                 if (silencio) memset(buf, 0, (size_t)frames * canales * sizeof(short));
                 else convertir(datos, buf, frames * canales, tipo, bytes);
                 IAudioCaptureClient_ReleaseBuffer(cc, frames);
-                enviar((char *)buf, (int)(frames * canales * sizeof(short)), !silencio);
+                if (canales > 2)
+                    for (UINT32 f = 0; f < frames; f++) {
+                        buf[f * 2] = buf[f * canales];
+                        buf[f * 2 + 1] = buf[f * canales + 1];
+                    }
+                enviar(buf, (int)frames, !silencio);
                 if (FAILED(IAudioCaptureClient_GetNextPacketSize(cc, &paquete))) break;
             }
 
@@ -517,6 +552,7 @@ static void actualizar_estado(HWND h) {
     if (ahora - tIP > 5000 || !txtIP[0]) { ip_local(ip, 32); tIP = ahora; } else wcscpy(ip, txtIP);
 
     EnterCriticalSection(&cs);
+    purgar(ahora);
     int n = nclientes;
     int sonando = n > 0 && ahora - g_ultimoEnvio < 1000;
     if (g_rate && wcsncmp(g_disp, L"No ", 3) != 0)
@@ -649,7 +685,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show) {
     WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);
     InitializeCriticalSection(&cs);
     timeBeginPeriod(1);
-    CreateThread(NULL, 0, hilo_aceptar, NULL, 0, NULL);
+    CreateThread(NULL, 0, hilo_red, NULL, 0, NULL);
     CreateThread(NULL, 0, hilo_captura, NULL, 0, NULL);
 
     crear_fotogramas();
