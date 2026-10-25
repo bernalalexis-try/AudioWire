@@ -16,10 +16,12 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.Process;
+import android.provider.Settings;
 
 import android.os.SystemClock;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -32,7 +34,6 @@ public class AudioService extends Service {
     public static final int PUERTO = 5005;
     private static final String CANAL_ID = "audiowire";
     private static final int RETRASO_MS = 60;
-    private static final byte[] HOLA = {'S', 'W', 'X', 'H'};
     private static final byte[] ADIOS = {'S', 'W', 'X', 'B'};
 
     public static volatile String estado = "Desconectado";
@@ -136,6 +137,45 @@ public class AudioService extends Service {
         }
     }
 
+    /* El nombre del teléfono: el de Ajustes y, si no hay, la marca y el modelo. */
+    private String nombreDispositivo() {
+        String n = null;
+        try {
+            if (Build.VERSION.SDK_INT >= 25)
+                n = Settings.Global.getString(getContentResolver(), Settings.Global.DEVICE_NAME);
+            if (n == null || n.trim().isEmpty())
+                n = Settings.Secure.getString(getContentResolver(), "bluetooth_name");
+        } catch (RuntimeException ignored) { }
+        if (n == null || n.trim().isEmpty()) {
+            String marca = Build.MANUFACTURER == null ? "" : Build.MANUFACTURER;
+            String modelo = Build.MODEL == null ? "" : Build.MODEL;
+            n = modelo.toLowerCase().startsWith(marca.toLowerCase()) ? modelo : marca + " " + modelo;
+        }
+        return n.trim();
+    }
+
+    /* "SWXH" + id del teléfono + "\n" + nombre. Cabe en 64 bytes, que es lo que lee el PC
+       (uno viejo descarta un saludo más largo); un PC viejo ignora lo que sigue a "SWXH". */
+    private byte[] saludo() {
+        String id = null;
+        try { id = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID); }
+        catch (RuntimeException ignored) { }
+        if (id == null) id = "";
+        if (id.length() > 16) id = id.substring(0, 16);
+        byte[] cab = ("SWXH" + id + "\n").getBytes(StandardCharsets.US_ASCII);
+        String nombre = nombreDispositivo();
+        byte[] nb = nombre.getBytes(StandardCharsets.UTF_8);
+        int lugar = 64 - cab.length;
+        while (nb.length > lugar && nombre.length() > 0) {
+            nombre = nombre.substring(0, nombre.offsetByCodePoints(nombre.length(), -1));
+            nb = nombre.getBytes(StandardCharsets.UTF_8);
+        }
+        byte[] out = new byte[cab.length + nb.length];
+        System.arraycopy(cab, 0, out, 0, cab.length);
+        System.arraycopy(nb, 0, out, cab.length, nb.length);
+        return out;
+    }
+
     private static int leer32(byte[] b, int p) {
         return (b[p] & 0xFF) | (b[p + 1] & 0xFF) << 8 | (b[p + 2] & 0xFF) << 16 | (b[p + 3] & 0xFF) << 24;
     }
@@ -171,7 +211,8 @@ public class AudioService extends Service {
             InetAddress dir = InetAddress.getByName(ip);
             s = new DatagramSocket();
             s.setSoTimeout(200);
-            DatagramPacket hola = new DatagramPacket(HOLA, HOLA.length, dir, PUERTO);
+            byte[] saludo = saludo();
+            DatagramPacket hola = new DatagramPacket(saludo, saludo.length, dir, PUERTO);
             byte[] buf = new byte[2048];
             byte[] silencio = new byte[2048];
             DatagramPacket p = new DatagramPacket(buf, buf.length);

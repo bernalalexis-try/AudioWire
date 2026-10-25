@@ -28,7 +28,8 @@ static const GUID G_SUB_PCM      = {0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xA
 static const PROPERTYKEY G_PKEY_Nombre = {{0xA45C254E,0xDF1C,0x4EFD,{0x80,0x20,0x67,0xD1,0x46,0xA8,0x50,0xE0}},14};
 
 static CRITICAL_SECTION cs;
-typedef struct { struct sockaddr_in dir; ULONGLONG visto; } Cliente;
+/* id y nombre llegan en el saludo de las apps nuevas ("SWXH" + id + "\n" + nombre). */
+typedef struct { struct sockaddr_in dir; ULONGLONG visto; char id[17]; wchar_t nombre[48]; } Cliente;
 static Cliente clientes[MAX_CLIENTES];
 static int nclientes = 0;
 static SOCKET g_sock = INVALID_SOCKET;
@@ -45,6 +46,139 @@ static volatile LONG g_vol = 100;
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
+
+/* Móviles por IP: desactivados (siguen conectados pero no reciben audio, solo
+   durante esta sesión) y bloqueados (se ignoran; se guardan en el registro). */
+#define MAX_LISTA 32
+static ULONG pausados[MAX_LISTA]; static int npausados = 0;
+static ULONG bloqueados[MAX_LISTA]; static int nbloqueados = 0;
+typedef struct { ULONG ip; wchar_t nombre[64]; } Nombre;
+static Nombre nombres[MAX_LISTA]; static int nnombres = 0;
+
+static int en_lista(const ULONG *l, int n, ULONG ip) {
+    for (int i = 0; i < n; i++) if (l[i] == ip) return i;
+    return -1;
+}
+static void agregar_a(ULONG *l, int *n, ULONG ip) { if (en_lista(l, *n, ip) < 0 && *n < MAX_LISTA) l[(*n)++] = ip; }
+static void quitar_de(ULONG *l, int *n, ULONG ip) { int i = en_lista(l, *n, ip); if (i >= 0) l[i] = l[--*n]; }
+
+static void ip_texto(ULONG ip, wchar_t *out) {
+    const unsigned char *b = (const unsigned char *)&ip;
+    swprintf(out, 16, L"%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+
+static const wchar_t *nombre_de(ULONG ip) {
+    for (int i = 0; i < nnombres; i++) if (nombres[i].ip == ip) return nombres[i].nombre;
+    return NULL;
+}
+
+/* El nombre de red del móvil (si el router lo conoce), sin frenar la red. */
+static DWORD WINAPI hilo_nombre(LPVOID arg) {
+    ULONG ip = (ULONG)(ULONG_PTR)arg;
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = ip;
+    wchar_t n[64];
+    if (GetNameInfoW((struct sockaddr *)&a, sizeof a, n, 64, NULL, 0, NI_NAMEREQD) != 0) return 0;
+    wchar_t *punto = wcschr(n, L'.'); if (punto) *punto = 0;
+    EnterCriticalSection(&cs);
+    for (int i = 0; i < nnombres; i++)
+        if (nombres[i].ip == ip) { wcsncpy(nombres[i].nombre, n, 63); nombres[i].nombre[63] = 0; break; }
+    LeaveCriticalSection(&cs);
+    return 0;
+}
+
+static void bloqueados_cargar(void) {
+    DWORD t = sizeof bloqueados;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Bloqueados", RRF_RT_REG_BINARY, NULL, bloqueados, &t) == ERROR_SUCCESS)
+        nbloqueados = (int)(t / sizeof bloqueados[0]);
+}
+static void bloqueados_guardar(void) {
+    ULONG copia[MAX_LISTA];
+    EnterCriticalSection(&cs);
+    int n = nbloqueados;
+    memcpy(copia, bloqueados, n * sizeof copia[0]);
+    LeaveCriticalSection(&cs);
+    if (n) RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Bloqueados", REG_BINARY, copia, n * sizeof copia[0]);
+    else RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Bloqueados");
+}
+
+/* Nombres puestos desde el PC, por id del teléfono (o "ip:x.x.x.x" si la app no manda id).
+   Se guardan en el registro como "clave<TAB>nombre". */
+typedef struct { wchar_t clave[24]; wchar_t nombre[48]; } Alias;
+static Alias alias[MAX_LISTA]; static int nalias = 0;
+
+static void clave_de(const char *id, ULONG ip, wchar_t *out) {
+    if (id && id[0]) swprintf(out, 24, L"%hs", id);
+    else { wchar_t t[16]; ip_texto(ip, t); swprintf(out, 24, L"ip:%ls", t); }
+}
+
+static const wchar_t *alias_de(const wchar_t *clave) {
+    for (int i = 0; i < nalias; i++) if (wcscmp(alias[i].clave, clave) == 0) return alias[i].nombre;
+    return NULL;
+}
+
+static void alias_poner(const wchar_t *clave, const wchar_t *nombre) {
+    int i = 0;
+    while (i < nalias && wcscmp(alias[i].clave, clave)) i++;
+    if (!nombre[0]) { if (i < nalias) alias[i] = alias[--nalias]; return; }
+    if (i == nalias) { if (nalias == MAX_LISTA) return; nalias++; }
+    wcsncpy(alias[i].clave, clave, 23); alias[i].clave[23] = 0;
+    wcsncpy(alias[i].nombre, nombre, 47); alias[i].nombre[47] = 0;
+}
+
+static void alias_cargar(void) {
+    wchar_t buf[MAX_LISTA * 80]; DWORD t = sizeof buf;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Alias", RRF_RT_REG_MULTI_SZ, NULL, buf, &t) != ERROR_SUCCESS) return;
+    for (wchar_t *p = buf; *p && nalias < MAX_LISTA;) {
+        size_t largo = wcslen(p);
+        wchar_t *tab = wcschr(p, L'\t');
+        if (tab) { *tab = 0; alias_poner(p, tab + 1); }
+        p += largo + 1;
+    }
+}
+
+static void alias_guardar(void) {
+    wchar_t buf[MAX_LISTA * 80]; size_t k = 0;
+    EnterCriticalSection(&cs);
+    for (int i = 0; i < nalias; i++) {
+        k += swprintf(buf + k, 80, L"%ls\t%ls", alias[i].clave, alias[i].nombre);
+        buf[k++] = 0;
+    }
+    int n = nalias;
+    LeaveCriticalSection(&cs);
+    buf[k++] = 0;
+    if (n) RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Alias", REG_MULTI_SZ, buf, (DWORD)(k * sizeof buf[0]));
+    else RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Alias");
+}
+
+/* id y nombre del saludo de una app nueva; una vieja manda solo "SWXH". */
+static void leer_saludo(Cliente *c, const char *b, int n) {
+    if (n <= 4) return;
+    const char *p = b + 4, *nl = memchr(p, '\n', (size_t)(n - 4));
+    if (!nl) return;
+    int li = 0;
+    for (const char *q = p; q < nl && li < 16; q++)
+        if ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z')) c->id[li++] = *q;
+    c->id[li] = 0;
+    int w = MultiByteToWideChar(CP_UTF8, 0, nl + 1, (int)(b + n - nl - 1), c->nombre, 47);
+    c->nombre[w > 0 ? w : 0] = 0;
+}
+
+static Cliente *cliente_de(ULONG ip) {
+    for (int i = 0; i < nclientes; i++) if (clientes[i].dir.sin_addr.s_addr == ip) return &clientes[i];
+    return NULL;
+}
+
+/* Cómo se muestra un móvil: el nombre puesto en el PC, el que manda el teléfono o el de la red.
+   Vacío si no hay ninguno (se muestra solo la IP). Se llama dentro de cs. */
+static void etiqueta(ULONG ip, wchar_t *out, int n) {
+    const Cliente *c = cliente_de(ip);
+    wchar_t clave[24]; clave_de(c ? c->id : NULL, ip, clave);
+    const wchar_t *a = alias_de(clave), *r = nombre_de(ip);
+    const wchar_t *t = a ? a : c && c->nombre[0] ? c->nombre : r ? r : L"";
+    wcsncpy(out, t, n - 1); out[n - 1] = 0;
+}
 
 static void purgar(ULONGLONG ahora) {
     for (int i = 0; i < nclientes;) {
@@ -63,7 +197,10 @@ static void enviar(const short *pcm, int frames, int conSonido) {
     EnterCriticalSection(&cs);
     ULONGLONG ahora = GetTickCount64();
     purgar(ahora);
-    if (nclientes && g_sock != INVALID_SOCKET) {
+    int activos = 0;
+    for (int i = 0; i < nclientes; i++)
+        if (en_lista(pausados, npausados, clientes[i].dir.sin_addr.s_addr) < 0) activos++;
+    if (activos && g_sock != INVALID_SOCKET) {
         if (conSonido) g_ultimoEnvio = ahora;
         int ch = (int)g_canales, maxF = MAX_DATOS / (ch * 2);
         DWORD rate = (DWORD)g_rate;
@@ -76,7 +213,8 @@ static void enviar(const short *pcm, int frames, int conSonido) {
             memcpy(paq + 8, &seq, 4);
             memcpy(paq + 12, pcm + (size_t)off * ch, (size_t)f * ch * 2);
             for (int i = 0; i < nclientes; i++)
-                sendto(g_sock, paq, 12 + f * ch * 2, 0, (struct sockaddr *)&clientes[i].dir, sizeof clientes[i].dir);
+                if (en_lista(pausados, npausados, clientes[i].dir.sin_addr.s_addr) < 0)
+                    sendto(g_sock, paq, 12 + f * ch * 2, 0, (struct sockaddr *)&clientes[i].dir, sizeof clientes[i].dir);
         }
     }
     LeaveCriticalSection(&cs);
@@ -110,14 +248,25 @@ static DWORD WINAPI hilo_red(LPVOID arg) {
         if (n < 4 || b[0] != 'S' || b[1] != 'W' || b[2] != 'X') { if (n < 0) Sleep(10); continue; }
         EnterCriticalSection(&cs);
         ULONGLONG ahora = GetTickCount64();
+        ULONG ip = de.sin_addr.s_addr;
+        int bloqueado = en_lista(bloqueados, nbloqueados, ip) >= 0;
         int i = buscar(&de);
-        if (b[3] == 'H') {
-            if (i >= 0) clientes[i].visto = ahora;
-            else if (nclientes < MAX_CLIENTES) { clientes[nclientes].dir = de; clientes[nclientes].visto = ahora; nclientes++; }
+        if (b[3] == 'H' && !bloqueado) {
+            if (i >= 0) { clientes[i].visto = ahora; leer_saludo(&clientes[i], b, n); }
+            else if (nclientes < MAX_CLIENTES) {
+                Cliente *c = &clientes[nclientes++];
+                c->dir = de; c->visto = ahora; c->id[0] = 0; c->nombre[0] = 0;
+                leer_saludo(c, b, n);
+                if (!nombre_de(ip) && nnombres < MAX_LISTA) {
+                    nombres[nnombres].ip = ip; nombres[nnombres].nombre[0] = 0; nnombres++;
+                    HANDLE t = CreateThread(NULL, 0, hilo_nombre, (LPVOID)(ULONG_PTR)ip, 0, NULL);
+                    if (t) CloseHandle(t);
+                }
+            }
             sendto(s, "SWXP", 4, 0, (struct sockaddr *)&de, sizeof de);
         } else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         LeaveCriticalSection(&cs);
-        if (b[3] == 'D') {
+        if (b[3] == 'D' && !bloqueado) {
             char r[80] = "SWXI";
             wchar_t nombre[MAX_COMPUTERNAME_LENGTH + 1]; DWORD tn = MAX_COMPUTERNAME_LENGTH + 1;
             if (!GetComputerNameW(nombre, &tn)) wcscpy(nombre, L"PC");
@@ -285,6 +434,10 @@ static int arrastrando = 0;
 #define CMD_ABRIR 1
 #define CMD_SILENCIAR 2
 #define CMD_SALIR 3
+#define CMD_DISP 100     /* + móvil * 3 + acción (0 activar/desactivar, 1 renombrar, 2 bloquear) */
+#define CMD_DESBLOQ 200  /* + posición en la lista de bloqueados */
+static ULONG menuIPs[MAX_CLIENTES], menuBloq[MAX_LISTA];
+static int nmenuIPs = 0, nmenuBloq = 0, estadoClic = 0;
 static NOTIFYICONDATAW nid;
 static UINT WM_TASKBAR_CREADA;
 static int enBandeja = 0, iconoActivo = -1;
@@ -421,6 +574,13 @@ static int en_icono(int x, int y) {
     return x >= cx - S(14) && x <= cx + S(14) && y >= cy - S(14) && y <= cy + S(14);
 }
 
+/* La línea de estado abre la lista de dispositivos cuando hay alguno. */
+static int en_estado(HWND h, int x, int y) {
+    RECT rc; GetClientRect(h, &rc);
+    int ey = y_base() + S(46);
+    return estadoClic && x >= S(16) && x <= rc.right - S(16) && y >= ey && y <= ey + S(24);
+}
+
 static int en_volumen(HWND h, int x, int y) {
     RECT rc; GetClientRect(h, &rc);
     int vy = vol_y();
@@ -445,7 +605,8 @@ static void vol_sumar(HWND h, int d) {
 static void bandeja_actualizar(int sonando) {
     if (!enBandeja) return;
     wchar_t tip[128];
-    const wchar_t *e = txtEstado; if (wcsncmp(e, L"●  ", 3) == 0) e += 3;
+    wchar_t e[96]; wcscpy(e, wcsncmp(txtEstado, L"●  ", 3) == 0 ? txtEstado + 3 : txtEstado);
+    wchar_t *flecha = wcsstr(e, L"  ▾"); if (flecha) *flecha = 0;
     swprintf(tip, 128, L"AudioWire · %ls\n%ls", e, txtIP);
     if (sonando != iconoActivo || wcscmp(tip, tipActual)) {
         iconoActivo = sonando;
@@ -478,10 +639,197 @@ static void restaurar(HWND h) {
     SetForegroundWindow(h);
 }
 
+/* Un submenú por móvil conectado y, si hay, la lista de bloqueados para desbloquearlos. */
+static void menu_dispositivos(HMENU m) {
+    EnterCriticalSection(&cs);
+    purgar(GetTickCount64());
+    int n = 0;
+    for (int i = 0; i < nclientes; i++) {
+        ULONG ip = clientes[i].dir.sin_addr.s_addr;
+        if (en_lista(menuIPs, n, ip) >= 0) continue;
+        menuIPs[n] = ip;
+        wchar_t ipt[16], nom[48], t[128];
+        ip_texto(ip, ipt);
+        etiqueta(ip, nom, 48);
+        int pausa = en_lista(pausados, npausados, ip) >= 0;
+        const wchar_t *marca = pausa ? L"  ·  desactivado" : L"";
+        if (nom[0]) swprintf(t, 128, L"%ls  (%ls)%ls", nom, ipt, marca);
+        else swprintf(t, 128, L"%ls%ls", ipt, marca);
+        HMENU sub = CreatePopupMenu();
+        AppendMenuW(sub, MF_STRING, CMD_DISP + n * 3, pausa ? L"Activar audio" : L"Desactivar audio");
+        AppendMenuW(sub, MF_STRING, CMD_DISP + n * 3 + 1, L"Renombrar…");
+        AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(sub, MF_STRING, CMD_DISP + n * 3 + 2, L"Bloquear");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, t);
+        n++;
+    }
+    nmenuIPs = n;
+    if (!n) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Ningún móvil conectado");
+    nmenuBloq = nbloqueados;
+    if (nbloqueados) {
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        HMENU sub = CreatePopupMenu();
+        for (int j = 0; j < nbloqueados; j++) {
+            menuBloq[j] = bloqueados[j];
+            wchar_t ipt[16], nom[48], t[96];
+            ip_texto(bloqueados[j], ipt);
+            etiqueta(bloqueados[j], nom, 48);
+            if (nom[0]) swprintf(t, 96, L"Desbloquear %ls  (%ls)", nom, ipt);
+            else swprintf(t, 96, L"Desbloquear %ls", ipt);
+            AppendMenuW(sub, MF_STRING, CMD_DESBLOQ + j, t);
+        }
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"Bloqueados");
+    }
+    LeaveCriticalSection(&cs);
+}
+
+static void menu_ventana(HWND h) {
+    HMENU m = CreatePopupMenu();
+    menu_dispositivos(m);
+    POINT p; GetCursorPos(&p);
+    TrackPopupMenu(m, TPM_LEFTALIGN | TPM_TOPALIGN, p.x, p.y, 0, h, NULL);
+    DestroyMenu(m);
+}
+
+static void actualizar_estado(HWND h);
+
+/* Cuadro para escribir un nombre. Devuelve 1 con "Guardar" (texto vacío = volver al original). */
+static int dlgOk, dlgFin;
+static wchar_t dlgTexto[48];
+
+static LRESULT CALLBACK ventana_nombre(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) { GetDlgItemTextW(h, 10, dlgTexto, 48); dlgOk = 1; DestroyWindow(h); }
+        else if (LOWORD(wp) == IDCANCEL) DestroyWindow(h);
+        return 0;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY: dlgFin = 1; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static int pedir_nombre(HWND dueno, const wchar_t *titulo, wchar_t *texto) {
+    static int registrada = 0;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    if (!registrada) {
+        WNDCLASSEXW wc = {sizeof wc};
+        wc.lpfnWndProc = ventana_nombre;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"AudioWireNombre";
+        RegisterClassExW(&wc);
+        registrada = 1;
+    }
+    DWORD estilo = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT r = {0, 0, S(320), S(118)};
+    AdjustWindowRect(&r, estilo, FALSE);
+    int an = r.right - r.left, al = r.bottom - r.top;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"AudioWireNombre", titulo, estilo,
+                               (GetSystemMetrics(SM_CXSCREEN) - an) / 2, (GetSystemMetrics(SM_CYSCREEN) - al) / 2,
+                               an, al, IsWindowVisible(dueno) ? dueno : NULL, NULL, inst, NULL);
+    HWND et = CreateWindowExW(0, L"STATIC", L"Nombre para este dispositivo (vacío = el original):", WS_CHILD | WS_VISIBLE,
+                              S(14), S(12), S(292), S(20), dlg, NULL, inst, NULL);
+    HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", texto, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                              S(14), S(36), S(292), S(26), dlg, (HMENU)10, inst, NULL);
+    HWND ok = CreateWindowExW(0, L"BUTTON", L"Guardar", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                              S(122), S(76), S(88), S(28), dlg, (HMENU)IDOK, inst, NULL);
+    HWND no = CreateWindowExW(0, L"BUTTON", L"Cancelar", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                              S(218), S(76), S(88), S(28), dlg, (HMENU)IDCANCEL, inst, NULL);
+    HFONT f = CreateFontW(-MulDiv(9, dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                          CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    HWND hijos[] = {et, ed, ok, no};
+    for (int i = 0; i < 4; i++) SendMessageW(hijos[i], WM_SETFONT, (WPARAM)f, TRUE);
+    SendMessageW(ed, EM_LIMITTEXT, 47, 0);
+    SendMessageW(ed, EM_SETSEL, 0, -1);
+
+    dlgOk = 0; dlgFin = 0;
+    if (IsWindowVisible(dueno)) EnableWindow(dueno, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+    SetFocus(ed);
+    MSG m; int salir = 0;
+    while (!dlgFin) {
+        if (GetMessageW(&m, NULL, 0, 0) <= 0) { salir = 1; break; }
+        if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+    }
+    EnableWindow(dueno, TRUE);
+    if (IsWindowVisible(dueno)) SetForegroundWindow(dueno);
+    DeleteObject(f);
+    if (salir) PostQuitMessage((int)m.wParam);
+    if (dlgOk) { wcsncpy(texto, dlgTexto, 47); texto[47] = 0; }
+    return dlgOk;
+}
+
+static void renombrar(HWND h, ULONG ip) {
+    wchar_t clave[24], actual[48], ipt[16], titulo[64];
+    EnterCriticalSection(&cs);
+    const Cliente *c = cliente_de(ip);
+    clave_de(c ? c->id : NULL, ip, clave);
+    etiqueta(ip, actual, 48);
+    LeaveCriticalSection(&cs);
+    ip_texto(ip, ipt);
+    swprintf(titulo, 64, L"Renombrar %ls", ipt);
+    if (!pedir_nombre(h, titulo, actual)) return;
+    wchar_t *t = actual; while (*t == L' ') t++;  /* sin espacios en los extremos */
+    size_t l = wcslen(t); while (l && t[l - 1] == L' ') t[--l] = 0;
+    EnterCriticalSection(&cs);
+    alias_poner(clave, t);
+    LeaveCriticalSection(&cs);
+    alias_guardar();
+}
+
+static void dispositivo_accion(HWND h, int k, int accion) {
+    EnterCriticalSection(&cs);
+    if (k >= nmenuIPs) { LeaveCriticalSection(&cs); return; }
+    ULONG ip = menuIPs[k];
+    wchar_t ipt[16], nom[48], quien[96];
+    ip_texto(ip, ipt);
+    etiqueta(ip, nom, 48);
+    if (nom[0]) swprintf(quien, 96, L"%ls (%ls)", nom, ipt); else wcscpy(quien, ipt);
+    if (accion == 0) {
+        if (en_lista(pausados, npausados, ip) >= 0) quitar_de(pausados, &npausados, ip);
+        else agregar_a(pausados, &npausados, ip);
+        LeaveCriticalSection(&cs);
+    } else if (accion == 1) {
+        LeaveCriticalSection(&cs);
+        renombrar(h, ip);
+    } else {
+        LeaveCriticalSection(&cs);
+        wchar_t msg[200];
+        swprintf(msg, 200, L"¿Bloquear %ls?\n\nNo va a poder conectarse hasta que lo desbloquees desde Dispositivos.", quien);
+        if (MessageBoxW(h, msg, L"AudioWire", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        EnterCriticalSection(&cs);
+        /* Así la lista de bloqueados sigue mostrando su nombre aunque ya no esté conectado. */
+        wchar_t clave[24]; clave_de(NULL, ip, clave);
+        if (nom[0] && !alias_de(clave)) alias_poner(clave, nom);
+        agregar_a(bloqueados, &nbloqueados, ip);
+        quitar_de(pausados, &npausados, ip);
+        for (int i = 0; i < nclientes;)
+            if (clientes[i].dir.sin_addr.s_addr == ip) clientes[i] = clientes[--nclientes]; else i++;
+        LeaveCriticalSection(&cs);
+        bloqueados_guardar();
+        alias_guardar();
+    }
+    actualizar_estado(h);
+}
+
+static void desbloquear(HWND h, int j) {
+    EnterCriticalSection(&cs);
+    if (j < nmenuBloq) quitar_de(bloqueados, &nbloqueados, menuBloq[j]);
+    LeaveCriticalSection(&cs);
+    bloqueados_guardar();
+    actualizar_estado(h);
+}
+
 static void menu_bandeja(HWND h) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, CMD_ABRIR, L"Abrir AudioWire");
     AppendMenuW(m, MF_STRING | (g_vol == 0 ? MF_CHECKED : 0), CMD_SILENCIAR, L"Silenciar");
+    HMENU d = CreatePopupMenu();
+    menu_dispositivos(d);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)d, L"Dispositivos");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, CMD_SALIR, L"Salir");
     SetMenuDefaultItem(m, CMD_ABRIR, FALSE);
@@ -560,6 +908,7 @@ static void actualizar_estado(HWND h) {
     else wcscpy(disp, g_disp);
     int errRed = g_errRed[0] != 0;
     if (errRed) swprintf(est, 96, L"●  %ls", g_errRed);
+    int hayBloq = nbloqueados > 0;
     LeaveCriticalSection(&cs);
 
     wchar_t moviles[24];
@@ -568,6 +917,8 @@ static void actualizar_estado(HWND h) {
     else if (sonando) { swprintf(est, 96, L"●  Transmitiendo · %ls", moviles); col = COL_ACENTO; }
     else if (n) { swprintf(est, 96, L"●  Conectado · %ls", moviles); col = COL_TEXTO; }
     else { wcscpy(est, L"●  Esperando"); col = COL_SUAVE; }
+    estadoClic = !errRed && (n || hayBloq);
+    if (estadoClic) wcscat(est, L"  ▾");
 
     int nuevoModo = sonando ? 1 : 0;
     if (nuevoModo != modo) {
@@ -610,6 +961,7 @@ static LRESULT CALLBACK ventana(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_vol) { volPrevio = g_vol; g_vol = 0; } else g_vol = volPrevio ? volPrevio : 100;
             vol_guardar(); InvalidateRect(h, NULL, FALSE);
         } else if (en_volumen(h, x, y)) { arrastrando = 1; SetCapture(h); vol_desde_x(h, x); InvalidateRect(h, NULL, FALSE); }
+        else if (en_estado(h, x, y)) menu_ventana(h);
         return 0;
     }
     case WM_LBUTTONDBLCLK:
@@ -634,7 +986,7 @@ static LRESULT CALLBACK ventana(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
             POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
-            SetCursor(LoadCursor(NULL, en_volumen(h, p.x, p.y) || en_icono(p.x, p.y) || arrastrando ? IDC_HAND : IDC_ARROW));
+            SetCursor(LoadCursor(NULL, en_volumen(h, p.x, p.y) || en_icono(p.x, p.y) || en_estado(h, p.x, p.y) || arrastrando ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
         break;
@@ -654,7 +1006,10 @@ static LRESULT CALLBACK ventana(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (LOWORD(wp) == CMD_SILENCIAR) {
             if (g_vol) { volPrevio = g_vol; g_vol = 0; } else g_vol = volPrevio ? volPrevio : 100;
             vol_guardar(); InvalidateRect(h, NULL, FALSE);
-        }
+        } else if (LOWORD(wp) >= CMD_DISP && LOWORD(wp) < CMD_DISP + MAX_CLIENTES * 3)
+            dispositivo_accion(h, (LOWORD(wp) - CMD_DISP) / 3, (LOWORD(wp) - CMD_DISP) % 3);
+        else if (LOWORD(wp) >= CMD_DESBLOQ && LOWORD(wp) < CMD_DESBLOQ + MAX_LISTA)
+            desbloquear(h, LOWORD(wp) - CMD_DESBLOQ);
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: pintar(h); return 0;
@@ -684,6 +1039,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show) {
 
     WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);
     InitializeCriticalSection(&cs);
+    bloqueados_cargar();
+    alias_cargar();
     timeBeginPeriod(1);
     CreateThread(NULL, 0, hilo_red, NULL, 0, NULL);
     CreateThread(NULL, 0, hilo_captura, NULL, 0, NULL);
