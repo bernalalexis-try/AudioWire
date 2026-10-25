@@ -28,6 +28,16 @@ If the connection drops, the phone reconnects on its own.
 
 > The app interface is currently in Spanish.
 
+## Connected devices
+
+On the PC, click the status line (`● Conectado · 2 móviles ▾`) or open **Dispositivos** (Devices) in the tray icon menu. Each phone is listed with its name and IP address, with these options:
+
+- **Desactivar audio** (Turn audio off): it stays connected but stops receiving sound, until you pick **Activar audio** (Turn audio on).
+- **Renombrar…** (Rename): The PC remembers it even if the phone's IP address changes. Leave it empty to go back to the original name.
+- **Bloquear** (Block): the PC ignores it and stops showing up on the network for that phone. Unblock it from **Bloqueados** (Blocked).
+
+The phone sends the name set in its Settings. With an older version of the app, only its IP address is shown.
+
 ## Requirements
 
 - A Windows PC, or a Linux PC with GTK 3 and PulseAudio or PipeWire (Ubuntu 22.04, Debian 12, Fedora 35 or newer).

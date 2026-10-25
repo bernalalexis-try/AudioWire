@@ -1,9 +1,11 @@
 #include <gtk/gtk.h>
+#include <glib/gstdio.h>
 #include <pulse/pulseaudio.h>
 #include <pulse/simple.h>
 #include <pulse/error.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <pthread.h>
 #include <signal.h>
@@ -47,7 +49,8 @@
 #define CADUCIDAD 3500
 
 static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { struct sockaddr_in dir; long long visto; } Cliente;
+/* id y nombre llegan en el saludo de las apps nuevas ("SWXH" + id + "\n" + nombre). */
+typedef struct { struct sockaddr_in dir; long long visto; char id[17]; char nombre[96]; } Cliente;
 static Cliente clientes[MAX_CLIENTES];
 static int nclientes = 0;
 static int g_sock = -1;
@@ -79,6 +82,162 @@ static int buscar(const struct sockaddr_in *d) {
     return -1;
 }
 
+/* Móviles por IP: desactivados (siguen conectados pero no reciben audio, solo
+   durante esta sesión) y bloqueados (se ignoran; se guardan en la configuración). */
+#define MAX_LISTA 32
+static uint32_t pausados[MAX_LISTA]; static int npausados = 0;
+static uint32_t bloqueados[MAX_LISTA]; static int nbloqueados = 0;
+typedef struct { uint32_t ip; char nombre[96]; } Nombre;
+static Nombre nombres[MAX_LISTA]; static int nnombres = 0;
+
+static int en_lista(const uint32_t *l, int n, uint32_t ip) {
+    for (int i = 0; i < n; i++) if (l[i] == ip) return i;
+    return -1;
+}
+static void agregar_a(uint32_t *l, int *n, uint32_t ip) { if (en_lista(l, *n, ip) < 0 && *n < MAX_LISTA) l[(*n)++] = ip; }
+static void quitar_de(uint32_t *l, int *n, uint32_t ip) { int i = en_lista(l, *n, ip); if (i >= 0) l[i] = l[--*n]; }
+
+static void ip_texto(uint32_t ip, char *out) {
+    struct in_addr a = {ip};
+    inet_ntop(AF_INET, &a, out, 16);
+}
+
+static const char *nombre_de(uint32_t ip) {
+    for (int i = 0; i < nnombres; i++) if (nombres[i].ip == ip) return nombres[i].nombre;
+    return NULL;
+}
+
+/* El nombre de red del móvil (si el router lo conoce), sin frenar la red. */
+static void *hilo_nombre(void *arg) {
+    uint32_t ip = (uint32_t)(uintptr_t)arg;
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = ip;
+    char n[96];
+    if (getnameinfo((struct sockaddr *)&a, sizeof a, n, sizeof n, NULL, 0, NI_NAMEREQD) != 0) return NULL;
+    char *punto = strchr(n, '.'); if (punto) *punto = 0;
+    pthread_mutex_lock(&mx);
+    for (int i = 0; i < nnombres; i++)
+        if (nombres[i].ip == ip) { snprintf(nombres[i].nombre, sizeof nombres[i].nombre, "%s", n); break; }
+    pthread_mutex_unlock(&mx);
+    return NULL;
+}
+
+static char *ruta_de(const char *archivo) {
+    return g_build_filename(g_get_user_config_dir(), "audiowire", archivo, NULL);
+}
+
+static void guardar_archivo(const char *archivo, const char *txt) {
+    char *ruta = ruta_de(archivo), *dir = g_path_get_dirname(ruta);
+    g_mkdir_with_parents(dir, 0755);
+    if (txt[0]) g_file_set_contents(ruta, txt, -1, NULL); else g_remove(ruta);
+    g_free(dir);
+    g_free(ruta);
+}
+
+static void bloqueados_cargar(void) {
+    char *ruta = ruta_de("bloqueados"), *txt = NULL;
+    if (g_file_get_contents(ruta, &txt, NULL, NULL)) {
+        char **lineas = g_strsplit(txt, "\n", -1);
+        for (char **l = lineas; *l; l++) {
+            struct in_addr a;
+            if (inet_pton(AF_INET, g_strstrip(*l), &a) == 1) agregar_a(bloqueados, &nbloqueados, a.s_addr);
+        }
+        g_strfreev(lineas);
+        g_free(txt);
+    }
+    g_free(ruta);
+}
+
+static void bloqueados_guardar(void) {
+    GString *s = g_string_new("");
+    pthread_mutex_lock(&mx);
+    for (int i = 0; i < nbloqueados; i++) {
+        char t[16]; ip_texto(bloqueados[i], t);
+        g_string_append_printf(s, "%s\n", t);
+    }
+    pthread_mutex_unlock(&mx);
+    guardar_archivo("bloqueados", s->str);
+    g_string_free(s, TRUE);
+}
+
+/* Nombres puestos desde el PC, por id del teléfono (o "ip:x.x.x.x" si la app no manda id).
+   Se guardan como líneas "clave<TAB>nombre". */
+typedef struct { char clave[24]; char nombre[96]; } Alias;
+static Alias alias[MAX_LISTA]; static int nalias = 0;
+
+static void clave_de(const char *id, uint32_t ip, char *out) {
+    if (id && id[0]) snprintf(out, 24, "%s", id);
+    else { char t[16]; ip_texto(ip, t); snprintf(out, 24, "ip:%s", t); }
+}
+
+static const char *alias_de(const char *clave) {
+    for (int i = 0; i < nalias; i++) if (strcmp(alias[i].clave, clave) == 0) return alias[i].nombre;
+    return NULL;
+}
+
+static void alias_poner(const char *clave, const char *nombre) {
+    int i = 0;
+    while (i < nalias && strcmp(alias[i].clave, clave)) i++;
+    if (!nombre[0]) { if (i < nalias) alias[i] = alias[--nalias]; return; }
+    if (i == nalias) { if (nalias == MAX_LISTA) return; nalias++; }
+    snprintf(alias[i].clave, sizeof alias[i].clave, "%s", clave);
+    snprintf(alias[i].nombre, sizeof alias[i].nombre, "%s", nombre);
+}
+
+static void alias_cargar(void) {
+    char *ruta = ruta_de("nombres"), *txt = NULL;
+    if (g_file_get_contents(ruta, &txt, NULL, NULL)) {
+        char **lineas = g_strsplit(txt, "\n", -1);
+        for (char **l = lineas; *l; l++) {
+            char *tab = strchr(*l, '\t');
+            if (tab) { *tab = 0; alias_poner(*l, tab + 1); }
+        }
+        g_strfreev(lineas);
+        g_free(txt);
+    }
+    g_free(ruta);
+}
+
+static void alias_guardar(void) {
+    GString *s = g_string_new("");
+    pthread_mutex_lock(&mx);
+    for (int i = 0; i < nalias; i++) g_string_append_printf(s, "%s\t%s\n", alias[i].clave, alias[i].nombre);
+    pthread_mutex_unlock(&mx);
+    guardar_archivo("nombres", s->str);
+    g_string_free(s, TRUE);
+}
+
+/* id y nombre del saludo de una app nueva; una vieja manda solo "SWXH". */
+static void leer_saludo(Cliente *c, const char *b, int n) {
+    if (n <= 4) return;
+    const char *p = b + 4, *nl = memchr(p, '\n', (size_t)(n - 4));
+    if (!nl) return;
+    int li = 0;
+    for (const char *q = p; q < nl && li < 16; q++)
+        if ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z')) c->id[li++] = *q;
+    c->id[li] = 0;
+    int largo = (int)(b + n - nl - 1);
+    if (largo > (int)sizeof c->nombre - 1) largo = (int)sizeof c->nombre - 1;
+    memcpy(c->nombre, nl + 1, (size_t)largo);
+    c->nombre[largo] = 0;
+    if (!g_utf8_validate(c->nombre, -1, NULL)) c->nombre[0] = 0;
+}
+
+static Cliente *cliente_de(uint32_t ip) {
+    for (int i = 0; i < nclientes; i++) if (clientes[i].dir.sin_addr.s_addr == ip) return &clientes[i];
+    return NULL;
+}
+
+/* Cómo se muestra un móvil: el nombre puesto en el PC, el que manda el teléfono o el de la red.
+   Vacío si no hay ninguno (se muestra solo la IP). Se llama con mx tomado. */
+static void etiqueta(uint32_t ip, char *out, size_t n) {
+    const Cliente *c = cliente_de(ip);
+    char clave[24]; clave_de(c ? c->id : NULL, ip, clave);
+    const char *a = alias_de(clave), *r = nombre_de(ip);
+    snprintf(out, n, "%s", a ? a : c && c->nombre[0] ? c->nombre : r ? r : "");
+}
+
 static void poner32(unsigned char *p, uint32_t v) {
     p[0] = v & 255; p[1] = (v >> 8) & 255; p[2] = (v >> 16) & 255; p[3] = (v >> 24) & 255;
 }
@@ -87,7 +246,10 @@ static void enviar(const int16_t *pcm, int frames, int sonido) {
     pthread_mutex_lock(&mx);
     long long ahora = ahora_ms();
     purgar(ahora);
-    if (nclientes && g_sock >= 0) {
+    int activos = 0;
+    for (int i = 0; i < nclientes; i++)
+        if (en_lista(pausados, npausados, clientes[i].dir.sin_addr.s_addr) < 0) activos++;
+    if (activos && g_sock >= 0) {
         if (sonido) g_ultimoSonido = ahora;
         int maxF = MAX_DATOS / (CANALES * 2);
         unsigned char paq[12 + MAX_DATOS] = {'S', 'W', 'A', CANALES};
@@ -97,8 +259,9 @@ static void enviar(const int16_t *pcm, int frames, int sonido) {
             poner32(paq + 8, g_seq++);
             memcpy(paq + 12, pcm + (size_t)off * CANALES, (size_t)f * CANALES * 2);
             for (int i = 0; i < nclientes; i++)
-                sendto(g_sock, paq, 12 + f * CANALES * 2, MSG_DONTWAIT, (struct sockaddr *)&clientes[i].dir,
-                       sizeof clientes[i].dir);
+                if (en_lista(pausados, npausados, clientes[i].dir.sin_addr.s_addr) < 0)
+                    sendto(g_sock, paq, 12 + f * CANALES * 2, MSG_DONTWAIT, (struct sockaddr *)&clientes[i].dir,
+                           sizeof clientes[i].dir);
         }
     }
     pthread_mutex_unlock(&mx);
@@ -131,18 +294,30 @@ static void *hilo_red(void *arg) {
         }
         pthread_mutex_lock(&mx);
         long long ahora = ahora_ms();
+        uint32_t ip = de.sin_addr.s_addr;
+        int bloqueado = en_lista(bloqueados, nbloqueados, ip) >= 0;
         int i = buscar(&de);
-        if (b[3] == 'H') {
-            if (i >= 0) clientes[i].visto = ahora;
+        if (b[3] == 'H' && !bloqueado) {
+            if (i >= 0) { clientes[i].visto = ahora; leer_saludo(&clientes[i], b, (int)n); }
             else if (nclientes < MAX_CLIENTES) {
-                clientes[nclientes].dir = de;
-                clientes[nclientes].visto = ahora;
-                nclientes++;
+                Cliente *c = &clientes[nclientes++];
+                c->dir = de;
+                c->visto = ahora;
+                c->id[0] = 0;
+                c->nombre[0] = 0;
+                leer_saludo(c, b, (int)n);
+                if (!nombre_de(ip) && nnombres < MAX_LISTA) {
+                    nombres[nnombres].ip = ip;
+                    nombres[nnombres].nombre[0] = 0;
+                    nnombres++;
+                    pthread_t t;
+                    if (pthread_create(&t, NULL, hilo_nombre, (void *)(uintptr_t)ip) == 0) pthread_detach(t);
+                }
             }
             sendto(s, "SWXP", 4, MSG_DONTWAIT, (struct sockaddr *)&de, sizeof de);
         } else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         pthread_mutex_unlock(&mx);
-        if (b[3] == 'D') {
+        if (b[3] == 'D' && !bloqueado) {
             char r[80] = "SWXI";
             if (gethostname(r + 4, sizeof r - 5) != 0) snprintf(r + 4, sizeof r - 4, "PC");
             r[sizeof r - 1] = 0;
@@ -285,7 +460,7 @@ static GtkWidget *ventana, *lienzo;
 static GtkStatusIcon *icono;
 static cairo_surface_t *superficies[2][SPR_N];
 static GdkPixbuf *pbIdle, *pbActivo;
-static int modo = 0, cuadro = 0, minimizada = 0, arrastrando = 0, manoPuesta = 0;
+static int modo = 0, cuadro = 0, minimizada = 0, arrastrando = 0, manoPuesta = 0, estadoClic = 0;
 static int volPrevio = 100;
 static guint idAnim = 0;
 static char txtIP[64] = "", txtEstado[160] = "", txtDisp[300] = "";
@@ -486,6 +661,7 @@ static void actualizar_estado(void) {
     else if (g_sink[0]) snprintf(disp, sizeof disp, "%s  ·  %d kHz", g_disp, RATE / 1000);
     else snprintf(disp, sizeof disp, "%s", g_disp);
     if (errRed) snprintf(est, sizeof est, "●  %s", g_errRed);
+    int hayBloq = nbloqueados > 0;
     pthread_mutex_unlock(&mx);
 
     char moviles[32];
@@ -495,6 +671,10 @@ static void actualizar_estado(void) {
     else if (sonando) { snprintf(est, sizeof est, "●  Transmitiendo · %s", moviles); col = COL_ACENTO; }
     else if (n) { snprintf(est, sizeof est, "●  Conectado · %s", moviles); col = COL_TEXTO; }
     else { snprintf(est, sizeof est, "●  Esperando"); col = COL_SUAVE; }
+    estadoClic = !errRed && (n || hayBloq);
+    char tipEst[160];
+    snprintf(tipEst, sizeof tipEst, "%s", strncmp(est, "●  ", 5) == 0 ? est + 5 : est);
+    if (estadoClic) strncat(est, "  ▾", sizeof est - strlen(est) - 1);
 
     int nuevo = sonando ? 1 : 0;
     if (nuevo != modo) {
@@ -511,7 +691,7 @@ static void actualizar_estado(void) {
         snprintf(txtDisp, sizeof txtDisp, "%s", disp);
         colEstado = col;
         char tip[256];
-        snprintf(tip, sizeof tip, "AudioWire · %s\n%s", strncmp(est, "●  ", 5) == 0 ? est + 5 : est, ip);
+        snprintf(tip, sizeof tip, "AudioWire · %s\n%s", tipEst, ip);
         gtk_status_icon_set_tooltip_text(icono, tip);
         gtk_widget_queue_draw(lienzo);
     }
@@ -551,6 +731,163 @@ static int en_volumen(double x, double y) {
     return x >= VOL_IZQ - 12 && x <= VOL_DER + 12 && fabs(y - VOL_Y) <= 16;
 }
 
+/* La línea de estado abre la lista de dispositivos cuando hay alguno. */
+static int en_estado(double x, double y) {
+    return estadoClic && x >= 16 && x <= ANCHO - 16 && y >= Y_BASE + 46 && y <= Y_BASE + 70;
+}
+
+/* ---- Dispositivos ---- */
+
+static void al_desactivar(GtkMenuItem *it, gpointer u) {
+    (void)it;
+    uint32_t ip = GPOINTER_TO_UINT(u);
+    pthread_mutex_lock(&mx);
+    if (en_lista(pausados, npausados, ip) >= 0) quitar_de(pausados, &npausados, ip);
+    else agregar_a(pausados, &npausados, ip);
+    pthread_mutex_unlock(&mx);
+    actualizar_estado();
+}
+
+static GtkWindow *padre(void) {
+    return gtk_widget_get_visible(ventana) ? GTK_WINDOW(ventana) : NULL;
+}
+
+static void al_renombrar(GtkMenuItem *it, gpointer u) {
+    (void)it;
+    uint32_t ip = GPOINTER_TO_UINT(u);
+    char clave[24], actual[96], ipt[16], titulo[64];
+    pthread_mutex_lock(&mx);
+    const Cliente *c = cliente_de(ip);
+    clave_de(c ? c->id : NULL, ip, clave);
+    etiqueta(ip, actual, sizeof actual);
+    pthread_mutex_unlock(&mx);
+    ip_texto(ip, ipt);
+    snprintf(titulo, sizeof titulo, "Renombrar %s", ipt);
+
+    GtkWidget *d = gtk_dialog_new_with_buttons(titulo, padre(), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                               "Cancelar", GTK_RESPONSE_CANCEL, "Guardar", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_dialog_set_default_response(GTK_DIALOG(d), GTK_RESPONSE_ACCEPT);
+    GtkWidget *caja = gtk_dialog_get_content_area(GTK_DIALOG(d));
+    gtk_container_set_border_width(GTK_CONTAINER(caja), 12);
+    gtk_box_set_spacing(GTK_BOX(caja), 8);
+    GtkWidget *et = gtk_label_new("Nombre para este dispositivo (vacío = el original):");
+    gtk_label_set_xalign(GTK_LABEL(et), 0);
+    GtkWidget *campo = gtk_entry_new();
+    gtk_entry_set_max_length(GTK_ENTRY(campo), 47);
+    gtk_entry_set_text(GTK_ENTRY(campo), actual);
+    gtk_entry_set_activates_default(GTK_ENTRY(campo), TRUE);
+    gtk_box_pack_start(GTK_BOX(caja), et, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(caja), campo, FALSE, FALSE, 0);
+    gtk_widget_show_all(d);
+    if (gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_ACCEPT) {
+        char nuevo[96];
+        snprintf(nuevo, sizeof nuevo, "%s", gtk_entry_get_text(GTK_ENTRY(campo)));
+        g_strstrip(nuevo);
+        pthread_mutex_lock(&mx);
+        alias_poner(clave, nuevo);
+        pthread_mutex_unlock(&mx);
+        alias_guardar();
+    }
+    gtk_widget_destroy(d);
+}
+
+static void al_bloquear(GtkMenuItem *it, gpointer u) {
+    (void)it;
+    uint32_t ip = GPOINTER_TO_UINT(u);
+    char nom[96], ipt[16], quien[128];
+    pthread_mutex_lock(&mx);
+    etiqueta(ip, nom, sizeof nom);
+    pthread_mutex_unlock(&mx);
+    ip_texto(ip, ipt);
+    if (nom[0]) snprintf(quien, sizeof quien, "%s (%s)", nom, ipt); else snprintf(quien, sizeof quien, "%s", ipt);
+    GtkWidget *d = gtk_message_dialog_new(padre(), GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO,
+                                          "¿Bloquear %s?", quien);
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(d),
+                                             "No va a poder conectarse hasta que lo desbloquees desde Dispositivos.");
+    int si = gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_YES;
+    gtk_widget_destroy(d);
+    if (!si) return;
+    pthread_mutex_lock(&mx);
+    /* Así la lista de bloqueados sigue mostrando su nombre aunque ya no esté conectado. */
+    char clave[24]; clave_de(NULL, ip, clave);
+    if (nom[0] && !alias_de(clave)) alias_poner(clave, nom);
+    agregar_a(bloqueados, &nbloqueados, ip);
+    quitar_de(pausados, &npausados, ip);
+    for (int i = 0; i < nclientes;)
+        if (clientes[i].dir.sin_addr.s_addr == ip) clientes[i] = clientes[--nclientes]; else i++;
+    pthread_mutex_unlock(&mx);
+    bloqueados_guardar();
+    alias_guardar();
+    actualizar_estado();
+}
+
+static void al_desbloquear(GtkMenuItem *it, gpointer u) {
+    (void)it;
+    pthread_mutex_lock(&mx);
+    quitar_de(bloqueados, &nbloqueados, GPOINTER_TO_UINT(u));
+    pthread_mutex_unlock(&mx);
+    bloqueados_guardar();
+    actualizar_estado();
+}
+
+static void item(GtkWidget *menu, const char *texto, GCallback cb, uint32_t ip) {
+    GtkWidget *i = gtk_menu_item_new_with_label(texto);
+    g_signal_connect(i, "activate", cb, GUINT_TO_POINTER(ip));
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), i);
+}
+
+/* Un submenú por móvil conectado y, si hay, la lista de bloqueados para desbloquearlos. */
+static GtkWidget *menu_dispositivos(void) {
+    GtkWidget *m = gtk_menu_new();
+    uint32_t vistos[MAX_CLIENTES];
+    int n = 0;
+    pthread_mutex_lock(&mx);
+    purgar(ahora_ms());
+    for (int i = 0; i < nclientes; i++) {
+        uint32_t ip = clientes[i].dir.sin_addr.s_addr;
+        if (en_lista(vistos, n, ip) >= 0) continue;
+        vistos[n++] = ip;
+        char ipt[16], nom[96], t[160];
+        ip_texto(ip, ipt);
+        etiqueta(ip, nom, sizeof nom);
+        int pausa = en_lista(pausados, npausados, ip) >= 0;
+        const char *marca = pausa ? "  ·  desactivado" : "";
+        if (nom[0]) snprintf(t, sizeof t, "%s  (%s)%s", nom, ipt, marca);
+        else snprintf(t, sizeof t, "%s%s", ipt, marca);
+        GtkWidget *sub = gtk_menu_new();
+        item(sub, pausa ? "Activar audio" : "Desactivar audio", G_CALLBACK(al_desactivar), ip);
+        item(sub, "Renombrar…", G_CALLBACK(al_renombrar), ip);
+        gtk_menu_shell_append(GTK_MENU_SHELL(sub), gtk_separator_menu_item_new());
+        item(sub, "Bloquear", G_CALLBACK(al_bloquear), ip);
+        GtkWidget *it = gtk_menu_item_new_with_label(t);
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(it), sub);
+        gtk_menu_shell_append(GTK_MENU_SHELL(m), it);
+    }
+    if (!n) {
+        GtkWidget *it = gtk_menu_item_new_with_label("Ningún móvil conectado");
+        gtk_widget_set_sensitive(it, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(m), it);
+    }
+    if (nbloqueados) {
+        gtk_menu_shell_append(GTK_MENU_SHELL(m), gtk_separator_menu_item_new());
+        GtkWidget *sub = gtk_menu_new();
+        for (int j = 0; j < nbloqueados; j++) {
+            char ipt[16], nom[96], t[160];
+            ip_texto(bloqueados[j], ipt);
+            etiqueta(bloqueados[j], nom, sizeof nom);
+            if (nom[0]) snprintf(t, sizeof t, "Desbloquear %s  (%s)", nom, ipt);
+            else snprintf(t, sizeof t, "Desbloquear %s", ipt);
+            item(sub, t, G_CALLBACK(al_desbloquear), bloqueados[j]);
+        }
+        GtkWidget *it = gtk_menu_item_new_with_label("Bloqueados");
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(it), sub);
+        gtk_menu_shell_append(GTK_MENU_SHELL(m), it);
+    }
+    pthread_mutex_unlock(&mx);
+    gtk_widget_show_all(m);
+    return m;
+}
+
 static void vol_desde_x(double x) {
     int v = (int)lround((x - VOL_IZQ) * VOL_MAX / (VOL_DER - VOL_IZQ));
     if (v > 95 && v < 105) v = 100;
@@ -570,6 +907,11 @@ static gboolean al_pulsar(GtkWidget *w, GdkEventButton *e, gpointer u) {
         arrastrando = 1;
         vol_desde_x(e->x);
         redibujar();
+    } else if (en_estado(e->x, e->y)) {
+        static GtkWidget *menu = NULL;
+        if (menu) gtk_widget_destroy(menu);
+        menu = menu_dispositivos();
+        gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)e);
     }
     return TRUE;
 }
@@ -587,7 +929,7 @@ static gboolean al_soltar(GtkWidget *w, GdkEventButton *e, gpointer u) {
 static gboolean al_mover(GtkWidget *w, GdkEventMotion *e, gpointer u) {
     (void)u;
     if (arrastrando) vol_desde_x(e->x);
-    int mano = arrastrando || en_volumen(e->x, e->y) || en_icono(e->x, e->y);
+    int mano = arrastrando || en_volumen(e->x, e->y) || en_icono(e->x, e->y) || en_estado(e->x, e->y);
     if (mano != manoPuesta) {
         manoPuesta = mano;
         GdkWindow *gw = gtk_widget_get_window(w);
@@ -644,8 +986,11 @@ static void al_menu_icono(GtkStatusIcon *i, guint boton, guint tiempo, gpointer 
     g_signal_connect(abrir, "activate", G_CALLBACK(menu_abrir), NULL);
     g_signal_connect(silenciar, "activate", G_CALLBACK(menu_silenciar), NULL);
     g_signal_connect(salir, "activate", G_CALLBACK(menu_salir), app);
+    GtkWidget *disp = gtk_menu_item_new_with_label("Dispositivos");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(disp), menu_dispositivos());
     gtk_menu_shell_append(GTK_MENU_SHELL(m), abrir);
     gtk_menu_shell_append(GTK_MENU_SHELL(m), silenciar);
+    gtk_menu_shell_append(GTK_MENU_SHELL(m), disp);
     gtk_menu_shell_append(GTK_MENU_SHELL(m), gtk_separator_menu_item_new());
     gtk_menu_shell_append(GTK_MENU_SHELL(m), salir);
     gtk_widget_show_all(m);
@@ -659,6 +1004,8 @@ static void al_activar(GtkApplication *app, gpointer u) {
         return;
     }
 
+    bloqueados_cargar();
+    alias_cargar();
     pthread_t t;
     pthread_create(&t, NULL, hilo_red, NULL);
     pthread_create(&t, NULL, hilo_info, NULL);

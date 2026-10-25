@@ -26,6 +26,16 @@ Envía el audio de tu PC con Windows o Linux a tu móvil Android por Wi-Fi.
 
 Si se corta, el móvil se reconecta solo.
 
+## Dispositivos conectados
+
+En el PC, haz clic en la línea de estado (`● Conectado · 2 móviles ▾`) o abre **Dispositivos** en el menú del ícono de la bandeja. Cada móvil aparece con su nombre y su IP, y tiene estas opciones:
+
+- **Desactivar audio:** sigue conectado pero deja de recibir sonido, hasta que elijas **Activar audio**.
+- **Renombrar…:** El PC lo recuerda aunque el móvil cambie de IP. Déjalo vacío para volver al nombre original.
+- **Bloquear:** el PC lo ignora y deja de aparecer en la red para ese móvil. Se desbloquea desde **Bloqueados**.
+
+El móvil envía el nombre que tiene en Ajustes. Con una versión anterior de la app solo se ve su IP.
+
 ## Requisitos
 
 - PC con Windows, o con Linux con GTK 3 y PulseAudio o PipeWire (Ubuntu 22.04, Debian 12, Fedora 35 o más nuevos).
