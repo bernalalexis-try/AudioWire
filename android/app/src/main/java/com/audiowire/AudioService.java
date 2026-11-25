@@ -11,6 +11,10 @@ import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.media.MediaFormat;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
@@ -21,6 +25,8 @@ import android.provider.Settings;
 import android.os.SystemClock;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -35,6 +41,8 @@ public class AudioService extends Service {
     private static final String CANAL_ID = "audiowire";
     private static final int RETRASO_MS = 60;
     private static final byte[] ADIOS = {'S', 'W', 'X', 'B'};
+    /* Le avisa al PC que este móvil decodifica Opus (los PCs viejos lo ignoran). */
+    private static final byte[] OPUS = {'S', 'W', 'X', 'O'};
 
     public static volatile String estado = "Desconectado";
     public static volatile boolean activo = false;
@@ -202,17 +210,88 @@ public class AudioService extends Service {
         return t;
     }
 
+    private static boolean tieneOpus() {
+        try {
+            for (MediaCodecInfo i : new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos()) {
+                if (i.isEncoder()) continue;
+                for (String t : i.getSupportedTypes())
+                    if (t.equalsIgnoreCase(MediaFormat.MIMETYPE_AUDIO_OPUS)) return true;
+            }
+        } catch (RuntimeException ignored) { }
+        return false;
+    }
+
+    private static ByteBuffer largo64(long v) {
+        ByteBuffer b = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder());
+        b.putLong(v).flip();
+        return b;
+    }
+
+    private static MediaCodec crearDecoder(int rate, int canales) throws IOException {
+        ByteBuffer cab = ByteBuffer.allocate(19).order(ByteOrder.LITTLE_ENDIAN);
+        cab.put("OpusHead".getBytes(StandardCharsets.US_ASCII)).put((byte) 1).put((byte) canales)
+                .putShort((short) 0).putInt(rate).putShort((short) 0).put((byte) 0).flip();
+        MediaFormat f = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, rate, canales);
+        f.setByteBuffer("csd-0", cab);
+        f.setByteBuffer("csd-1", largo64(0));
+        f.setByteBuffer("csd-2", largo64(80_000_000L));
+        MediaCodec d = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS);
+        d.configure(f, null, null, 0);
+        d.start();
+        return d;
+    }
+
+    private final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+    private byte[] pcm = new byte[8192];
+    private long pts = 0;
+
+    /* Pasa un paquete Opus al decoder y escribe en la pista lo que ya salió, sin pasar de "libre" frames.
+       Devuelve los frames escritos. */
+    private int decodificar(MediaCodec d, byte[] b, int off, int len, AudioTrack pista, int libre, int bytesFrame) {
+        int in = d.dequeueInputBuffer(5000);
+        if (in >= 0) {
+            ByteBuffer ib = d.getInputBuffer(in);
+            ib.clear();
+            ib.put(b, off, len);
+            d.queueInputBuffer(in, 0, len, pts, 0);
+            pts += 10_000;
+        }
+        int escritos = 0;
+        for (;;) {
+            int o = d.dequeueOutputBuffer(info, 0);
+            if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED || o == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) continue;
+            if (o < 0) break;
+            ByteBuffer ob = d.getOutputBuffer(o);
+            int tam = info.size;
+            if (ob != null && tam > 0) {
+                if (pcm.length < tam) pcm = new byte[tam];
+                ob.position(info.offset);
+                ob.get(pcm, 0, tam);
+                int f = tam / bytesFrame;
+                if (escritos + f <= libre) {
+                    int w = pista.write(pcm, 0, f * bytesFrame);
+                    if (w > 0) escritos += w / bytesFrame;
+                }
+            }
+            d.releaseOutputBuffer(o, false);
+        }
+        return escritos;
+    }
+
     private void bucle(String ip, String quien, AtomicBoolean vivo) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         estado = "Conectando a " + quien + "…";
         DatagramSocket s = null;
         AudioTrack pista = null;
+        MediaCodec dec = null;
         try {
             InetAddress dir = InetAddress.getByName(ip);
             s = new DatagramSocket();
             s.setSoTimeout(200);
             byte[] saludo = saludo();
             DatagramPacket hola = new DatagramPacket(saludo, saludo.length, dir, PUERTO);
+            DatagramPacket conOpus = tieneOpus() ? new DatagramPacket(OPUS, OPUS.length, dir, PUERTO) : null;
+            boolean esOpus = false;
             byte[] buf = new byte[2048];
             byte[] silencio = new byte[2048];
             DatagramPacket p = new DatagramPacket(buf, buf.length);
@@ -224,7 +303,10 @@ public class AudioService extends Service {
             while (vivo.get()) {
                 long ahora = SystemClock.elapsedRealtime();
                 if (ahora - ultimoHola >= 1000) {
-                    try { s.send(hola); } catch (IOException ignored) { }
+                    try {
+                        s.send(hola);
+                        if (conOpus != null) s.send(conOpus);
+                    } catch (IOException ignored) { }
                     ultimoHola = ahora;
                 }
                 if (ahora - ultimoEstado >= 250) {
@@ -258,25 +340,31 @@ public class AudioService extends Service {
                     ultimaEspera = ahora;
                     continue;
                 }
-                if (buf[2] != 'A' || n < 12) continue;
+                boolean opus = buf[2] == 'O';
+                if ((buf[2] != 'A' && !opus) || n < 12) continue;
 
                 int ch = buf[3] & 0xFF, r = leer32(buf, 4), seq = leer32(buf, 8);
                 if (ch < 1 || ch > 2 || r < 8000 || r > 192000) continue;
+                if (opus && (conOpus == null || r != 48000)) continue;
                 ultimaRespuesta = ahora;
                 ultimoAudio = ahora;
 
-                if (pista == null || r != rate || ch != canales) {
+                if (pista == null || r != rate || ch != canales || opus != esOpus) {
                     if (pista != null) pista.release();
+                    if (dec != null) { dec.release(); dec = null; }
                     pista = crearPista(r, ch);
                     capacidad = pista.getBufferSizeInFrames();
                     rate = r;
                     canales = ch;
                     escritos = 0;
                     haySeq = false;
+                    esOpus = opus;
+                    if (opus) dec = crearDecoder(r, ch);
                 }
 
                 int bytesFrame = canales * 2;
-                int frames = (n - 12) / bytesFrame;
+                /* Un paquete Opus trae 10 ms de audio. */
+                int frames = opus ? r / 100 : (n - 12) / bytesFrame;
                 if (haySeq) {
                     int dif = seq - seqEsperado;
                     if (dif < 0 && dif > -1000) continue;
@@ -293,6 +381,11 @@ public class AudioService extends Service {
                 }
                 seqEsperado = seq + 1;
                 haySeq = true;
+                if (opus) {
+                    /* Se decodifica siempre para no romper el decoder; si la cola está llena, se descarta. */
+                    escritos += decodificar(dec, buf, 12, n - 12, pista, capacidad - cola, bytesFrame);
+                    continue;
+                }
                 if (cola + frames > capacidad) continue;
                 int w = pista.write(buf, 12, frames * bytesFrame);
                 if (w > 0) escritos += w / bytesFrame;
@@ -309,6 +402,10 @@ public class AudioService extends Service {
             if (pista != null) {
                 try { pista.stop(); } catch (IllegalStateException ignored) { }
                 pista.release();
+            }
+            if (dec != null) {
+                try { dec.stop(); } catch (IllegalStateException ignored) { }
+                dec.release();
             }
         }
     }

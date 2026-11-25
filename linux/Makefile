@@ -1,5 +1,5 @@
 CFLAGS ?= -O2 -Wall
-PAQUETES = gtk+-3.0 libpulse libpulse-simple
+PAQUETES = gtk+-3.0 libpulse libpulse-simple opus
 
 audiowire: audiowire.c sprites.h
 	$(CC) $(CFLAGS) -Wno-deprecated-declarations -Wl,--as-needed -o $@ audiowire.c $$(pkg-config --cflags --libs $(PAQUETES)) -lm -lpthread

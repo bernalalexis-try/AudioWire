@@ -14,9 +14,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
+#include <opus/opus.h>
 #include "sprites.h"
 
 #define PUERTO 5005
+#define OPUS_FRAMES 480 /* 10 ms a 48 kHz */
 #define MAX_CLIENTES 16
 
 static const GUID G_CLSID_Enum   = {0xBCDE0395,0xE52F,0x467C,{0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E}};
@@ -29,8 +31,9 @@ static const PROPERTYKEY G_PKEY_Nombre = {{0xA45C254E,0xDF1C,0x4EFD,{0x80,0x20,0
 
 static CRITICAL_SECTION cs;
 /* id y nombre llegan en el saludo de las apps nuevas ("SWXH" + id + "\n" + nombre). */
-/* ok: el usuario lo aceptó y recibe audio; mientras no, queda esperando. */
-typedef struct { struct sockaddr_in dir; ULONGLONG visto; char id[17]; wchar_t nombre[48]; int ok; } Cliente;
+/* ok: el usuario lo aceptó y recibe audio; mientras no, queda esperando.
+   opus: la app avisó ("SWXO") que sabe decodificar Opus. */
+typedef struct { struct sockaddr_in dir; ULONGLONG visto; char id[17]; wchar_t nombre[48]; int ok, opus; } Cliente;
 static Cliente clientes[MAX_CLIENTES];
 static int nclientes = 0;
 static SOCKET g_sock = INVALID_SOCKET;
@@ -234,27 +237,69 @@ static int recibe(const Cliente *c) {
     return c->ok && en_lista(pausados, npausados, c->dir.sin_addr.s_addr) < 0;
 }
 
+/* Opus: los móviles que lo entienden reciben el audio comprimido (mucho menos Wi-Fi).
+   Solo a 48 kHz; los demás siguen recibiendo PCM. Se llama dentro de cs. */
+static OpusEncoder *g_enc = NULL;
+static int g_encCanales = 0;
+static short g_acum[OPUS_FRAMES * 2];
+static int g_nacum = 0;
+static DWORD g_seqOpus = 0;
+
+static int usa_opus(const Cliente *c) { return c->opus && g_rate == 48000; }
+
+static void enviar_opus(const short *pcm, int frames, int ch) {
+    if (!g_enc || g_encCanales != ch) {
+        if (g_enc) opus_encoder_destroy(g_enc);
+        int err = 0;
+        g_enc = opus_encoder_create(48000, ch, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
+        if (err != OPUS_OK) { g_enc = NULL; return; }
+        opus_encoder_ctl(g_enc, OPUS_SET_BITRATE(ch == 2 ? 128000 : 64000));
+        g_encCanales = ch;
+        g_nacum = 0;
+    }
+    char paq[12 + 1500];
+    DWORD rate = 48000;
+    paq[0] = 'S'; paq[1] = 'W'; paq[2] = 'O'; paq[3] = (char)ch;
+    memcpy(paq + 4, &rate, 4);
+    for (int off = 0; off < frames;) {
+        int f = OPUS_FRAMES - g_nacum;
+        if (f > frames - off) f = frames - off;
+        memcpy(g_acum + (size_t)g_nacum * ch, pcm + (size_t)off * ch, (size_t)f * ch * sizeof(short));
+        g_nacum += f; off += f;
+        if (g_nacum < OPUS_FRAMES) break;
+        g_nacum = 0;
+        int n = opus_encode(g_enc, g_acum, OPUS_FRAMES, (unsigned char *)paq + 12, 1500);
+        if (n <= 0) continue;
+        DWORD seq = g_seqOpus++;
+        memcpy(paq + 8, &seq, 4);
+        for (int i = 0; i < nclientes; i++)
+            if (recibe(&clientes[i]) && usa_opus(&clientes[i]))
+                sendto(g_sock, paq, 12 + n, 0, (struct sockaddr *)&clientes[i].dir, sizeof clientes[i].dir);
+    }
+}
+
 static void enviar(const short *pcm, int frames, int conSonido) {
     EnterCriticalSection(&cs);
     ULONGLONG ahora = GetTickCount64();
     purgar(ahora);
-    int activos = 0;
+    int conPcm = 0, conOpus = 0;
     for (int i = 0; i < nclientes; i++)
-        if (recibe(&clientes[i])) activos++;
-    if (activos && g_sock != INVALID_SOCKET) {
+        if (recibe(&clientes[i])) { if (usa_opus(&clientes[i])) conOpus++; else conPcm++; }
+    if ((conPcm || conOpus) && g_sock != INVALID_SOCKET) {
         if (conSonido) g_ultimoEnvio = ahora;
         int ch = (int)g_canales, maxF = MAX_DATOS / (ch * 2);
+        if (conOpus) enviar_opus(pcm, frames, ch); else g_nacum = 0;
         DWORD rate = (DWORD)g_rate;
         char paq[12 + MAX_DATOS];
         paq[0] = 'S'; paq[1] = 'W'; paq[2] = 'A'; paq[3] = (char)ch;
         memcpy(paq + 4, &rate, 4);
-        for (int off = 0; off < frames; off += maxF) {
+        for (int off = 0; conPcm && off < frames; off += maxF) {
             int f = frames - off < maxF ? frames - off : maxF;
             DWORD seq = g_seq++;
             memcpy(paq + 8, &seq, 4);
             memcpy(paq + 12, pcm + (size_t)off * ch, (size_t)f * ch * 2);
             for (int i = 0; i < nclientes; i++)
-                if (recibe(&clientes[i]))
+                if (recibe(&clientes[i]) && !usa_opus(&clientes[i]))
                     sendto(g_sock, paq, 12 + f * ch * 2, 0, (struct sockaddr *)&clientes[i].dir, sizeof clientes[i].dir);
         }
     }
@@ -297,7 +342,7 @@ static DWORD WINAPI hilo_red(LPVOID arg) {
             if (i >= 0) { c = &clientes[i]; c->visto = ahora; leer_saludo(c, b, n); }
             else if (nclientes < MAX_CLIENTES) {
                 c = &clientes[nclientes++];
-                c->dir = de; c->visto = ahora; c->id[0] = 0; c->nombre[0] = 0;
+                c->dir = de; c->visto = ahora; c->id[0] = 0; c->nombre[0] = 0; c->opus = 0;
                 leer_saludo(c, b, n);
                 if (!nombre_de(ip) && nnombres < MAX_LISTA) {
                     nombres[nnombres].ip = ip; nombres[nnombres].nombre[0] = 0; nnombres++;
@@ -316,7 +361,8 @@ static DWORD WINAPI hilo_red(LPVOID arg) {
                 }
             }
             sendto(s, ok ? "SWXP" : "SWXW", 4, 0, (struct sockaddr *)&de, sizeof de);
-        } else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
+        } else if (b[3] == 'O' && i >= 0) clientes[i].opus = 1;
+        else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         LeaveCriticalSection(&cs);
         if (b[3] == 'D' && !bloqueado) {
             char r[80] = "SWXI";
