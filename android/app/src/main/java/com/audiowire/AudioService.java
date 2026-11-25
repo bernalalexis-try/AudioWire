@@ -217,7 +217,7 @@ public class AudioService extends Service {
             byte[] silencio = new byte[2048];
             DatagramPacket p = new DatagramPacket(buf, buf.length);
 
-            long ultimoHola = 0, ultimaRespuesta = 0, ultimoAudio = 0, ultimoEstado = 0;
+            long ultimoHola = 0, ultimaRespuesta = 0, ultimoAudio = 0, ultimoEstado = 0, ultimaEspera = 0;
             int rate = 0, canales = 0, seqEsperado = 0, escritos = 0, capacidad = 0;
             boolean haySeq = false;
 
@@ -231,6 +231,7 @@ public class AudioService extends Service {
                     ultimoEstado = ahora;
                     if (ultimaRespuesta == 0) estado = "Conectando a " + quien + "…";
                     else if (ahora - ultimaRespuesta > 3000) estado = "Sin respuesta de " + quien + ". Reintentando…";
+                    else if (ahora - ultimaEspera < 3000) estado = "Esperando que aceptes este móvil en " + quien + "…";
                     else if (ahora - ultimoAudio < 1000) estado = "Reproduciendo desde " + quien;
                     else estado = "Conectado a " + quien + " · sin sonido";
                 }
@@ -249,6 +250,12 @@ public class AudioService extends Service {
                 if (n < 4 || buf[0] != 'S' || buf[1] != 'W') continue;
                 if (buf[2] == 'X' && buf[3] == 'P') {
                     ultimaRespuesta = ahora;
+                    ultimaEspera = 0;
+                    continue;
+                }
+                if (buf[2] == 'X' && buf[3] == 'W') {
+                    ultimaRespuesta = ahora;
+                    ultimaEspera = ahora;
                     continue;
                 }
                 if (buf[2] != 'A' || n < 12) continue;

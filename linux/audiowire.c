@@ -50,7 +50,8 @@
 
 static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
 /* id y nombre llegan en el saludo de las apps nuevas ("SWXH" + id + "\n" + nombre). */
-typedef struct { struct sockaddr_in dir; long long visto; char id[17]; char nombre[96]; } Cliente;
+/* ok: el usuario lo aceptó y recibe audio; mientras no, queda esperando. */
+typedef struct { struct sockaddr_in dir; long long visto; char id[17]; char nombre[96]; int ok; } Cliente;
 static Cliente clientes[MAX_CLIENTES];
 static int nclientes = 0;
 static int g_sock = -1;
@@ -208,6 +209,41 @@ static void alias_guardar(void) {
     g_string_free(s, TRUE);
 }
 
+/* Móviles aceptados, por la misma clave que los alias. Un móvil nuevo no recibe audio
+   hasta que el usuario lo acepta; se guardan en la configuración. */
+static char permitidos[MAX_LISTA][24]; static int npermitidos = 0;
+static char g_preguntando[24] = "";
+
+static int permitido(const char *clave) {
+    for (int i = 0; i < npermitidos; i++) if (strcmp(permitidos[i], clave) == 0) return 1;
+    return 0;
+}
+
+static void permitidos_cargar(void) {
+    char *ruta = ruta_de("permitidos"), *txt = NULL;
+    if (g_file_get_contents(ruta, &txt, NULL, NULL)) {
+        char **lineas = g_strsplit(txt, "\n", -1);
+        for (char **l = lineas; *l && npermitidos < MAX_LISTA; l++) {
+            g_strstrip(*l);
+            if ((*l)[0]) snprintf(permitidos[npermitidos++], 24, "%s", *l);
+        }
+        g_strfreev(lineas);
+        g_free(txt);
+    }
+    g_free(ruta);
+}
+
+static void permitidos_guardar(void) {
+    GString *s = g_string_new("");
+    pthread_mutex_lock(&mx);
+    for (int i = 0; i < npermitidos; i++) g_string_append_printf(s, "%s\n", permitidos[i]);
+    pthread_mutex_unlock(&mx);
+    guardar_archivo("permitidos", s->str);
+    g_string_free(s, TRUE);
+}
+
+static gboolean pedir_permiso(gpointer u);
+
 /* id y nombre del saludo de una app nueva; una vieja manda solo "SWXH". */
 static void leer_saludo(Cliente *c, const char *b, int n) {
     if (n <= 4) return;
@@ -242,13 +278,17 @@ static void poner32(unsigned char *p, uint32_t v) {
     p[0] = v & 255; p[1] = (v >> 8) & 255; p[2] = (v >> 16) & 255; p[3] = (v >> 24) & 255;
 }
 
+static int recibe(const Cliente *c) {
+    return c->ok && en_lista(pausados, npausados, c->dir.sin_addr.s_addr) < 0;
+}
+
 static void enviar(const int16_t *pcm, int frames, int sonido) {
     pthread_mutex_lock(&mx);
     long long ahora = ahora_ms();
     purgar(ahora);
     int activos = 0;
     for (int i = 0; i < nclientes; i++)
-        if (en_lista(pausados, npausados, clientes[i].dir.sin_addr.s_addr) < 0) activos++;
+        if (recibe(&clientes[i])) activos++;
     if (activos && g_sock >= 0) {
         if (sonido) g_ultimoSonido = ahora;
         int maxF = MAX_DATOS / (CANALES * 2);
@@ -259,7 +299,7 @@ static void enviar(const int16_t *pcm, int frames, int sonido) {
             poner32(paq + 8, g_seq++);
             memcpy(paq + 12, pcm + (size_t)off * CANALES, (size_t)f * CANALES * 2);
             for (int i = 0; i < nclientes; i++)
-                if (en_lista(pausados, npausados, clientes[i].dir.sin_addr.s_addr) < 0)
+                if (recibe(&clientes[i]))
                     sendto(g_sock, paq, 12 + f * CANALES * 2, MSG_DONTWAIT, (struct sockaddr *)&clientes[i].dir,
                            sizeof clientes[i].dir);
         }
@@ -298,9 +338,10 @@ static void *hilo_red(void *arg) {
         int bloqueado = en_lista(bloqueados, nbloqueados, ip) >= 0;
         int i = buscar(&de);
         if (b[3] == 'H' && !bloqueado) {
-            if (i >= 0) { clientes[i].visto = ahora; leer_saludo(&clientes[i], b, (int)n); }
+            Cliente *c = NULL;
+            if (i >= 0) { c = &clientes[i]; c->visto = ahora; leer_saludo(c, b, (int)n); }
             else if (nclientes < MAX_CLIENTES) {
-                Cliente *c = &clientes[nclientes++];
+                c = &clientes[nclientes++];
                 c->dir = de;
                 c->visto = ahora;
                 c->id[0] = 0;
@@ -314,7 +355,17 @@ static void *hilo_red(void *arg) {
                     if (pthread_create(&t, NULL, hilo_nombre, (void *)(uintptr_t)ip) == 0) pthread_detach(t);
                 }
             }
-            sendto(s, "SWXP", 4, MSG_DONTWAIT, (struct sockaddr *)&de, sizeof de);
+            int ok = 1;
+            if (c) {
+                char clave[24]; clave_de(c->id, ip, clave);
+                c->ok = ok = permitido(clave);
+                /* Se pregunta por un móvil a la vez; los demás esperan su turno. */
+                if (!ok && !g_preguntando[0]) {
+                    snprintf(g_preguntando, sizeof g_preguntando, "%s", clave);
+                    g_idle_add(pedir_permiso, GUINT_TO_POINTER(ip));
+                }
+            }
+            sendto(s, ok ? "SWXP" : "SWXW", 4, MSG_DONTWAIT, (struct sockaddr *)&de, sizeof de);
         } else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         pthread_mutex_unlock(&mx);
         if (b[3] == 'D' && !bloqueado) {
@@ -654,7 +705,8 @@ static void actualizar_estado(void) {
 
     pthread_mutex_lock(&mx);
     purgar(ahora);
-    int n = nclientes;
+    int n = 0;
+    for (int i = 0; i < nclientes; i++) if (clientes[i].ok) n++;
     int sonando = n > 0 && ahora - g_ultimoSonido < 1000;
     int errRed = g_errRed[0] != 0;
     if (g_errAudio[0]) snprintf(disp, sizeof disp, "%s", g_errAudio);
@@ -821,6 +873,40 @@ static void al_bloquear(GtkMenuItem *it, gpointer u) {
     actualizar_estado();
 }
 
+/* Un móvil nuevo pidió audio: se acepta una vez y queda recordado; si no, queda bloqueado. */
+static gboolean pedir_permiso(gpointer u) {
+    uint32_t ip = GPOINTER_TO_UINT(u);
+    char clave[24], nom[96], ipt[16], quien[128];
+    pthread_mutex_lock(&mx);
+    snprintf(clave, sizeof clave, "%s", g_preguntando);
+    etiqueta(ip, nom, sizeof nom);
+    pthread_mutex_unlock(&mx);
+    if (!clave[0]) return G_SOURCE_REMOVE;
+    ip_texto(ip, ipt);
+    if (nom[0]) snprintf(quien, sizeof quien, "%s (%s)", nom, ipt); else snprintf(quien, sizeof quien, "%s", ipt);
+    GtkWidget *d = gtk_message_dialog_new(padre(), GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO,
+                                          "¿Dejar que %s escuche el audio de esta PC?", quien);
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(d), "Si no lo conocés, elegí No y queda bloqueado.");
+    gtk_window_set_keep_above(GTK_WINDOW(d), TRUE);
+    int si = gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_YES;
+    gtk_widget_destroy(d);
+    pthread_mutex_lock(&mx);
+    if (si) {
+        if (!permitido(clave) && npermitidos < MAX_LISTA) snprintf(permitidos[npermitidos++], 24, "%s", clave);
+    } else {
+        char claveIp[24]; clave_de(NULL, ip, claveIp);
+        if (nom[0] && !alias_de(claveIp)) alias_poner(claveIp, nom);
+        agregar_a(bloqueados, &nbloqueados, ip);
+        for (int i = 0; i < nclientes;)
+            if (clientes[i].dir.sin_addr.s_addr == ip) clientes[i] = clientes[--nclientes]; else i++;
+    }
+    g_preguntando[0] = 0;
+    pthread_mutex_unlock(&mx);
+    if (si) permitidos_guardar(); else { bloqueados_guardar(); alias_guardar(); }
+    actualizar_estado();
+    return G_SOURCE_REMOVE;
+}
+
 static void al_desbloquear(GtkMenuItem *it, gpointer u) {
     (void)it;
     pthread_mutex_lock(&mx);
@@ -845,7 +931,7 @@ static GtkWidget *menu_dispositivos(void) {
     purgar(ahora_ms());
     for (int i = 0; i < nclientes; i++) {
         uint32_t ip = clientes[i].dir.sin_addr.s_addr;
-        if (en_lista(vistos, n, ip) >= 0) continue;
+        if (!clientes[i].ok || en_lista(vistos, n, ip) >= 0) continue;
         vistos[n++] = ip;
         char ipt[16], nom[96], t[160];
         ip_texto(ip, ipt);
@@ -1006,6 +1092,7 @@ static void al_activar(GtkApplication *app, gpointer u) {
 
     bloqueados_cargar();
     alias_cargar();
+    permitidos_cargar();
     pthread_t t;
     pthread_create(&t, NULL, hilo_red, NULL);
     pthread_create(&t, NULL, hilo_info, NULL);

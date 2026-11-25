@@ -29,7 +29,8 @@ static const PROPERTYKEY G_PKEY_Nombre = {{0xA45C254E,0xDF1C,0x4EFD,{0x80,0x20,0
 
 static CRITICAL_SECTION cs;
 /* id y nombre llegan en el saludo de las apps nuevas ("SWXH" + id + "\n" + nombre). */
-typedef struct { struct sockaddr_in dir; ULONGLONG visto; char id[17]; wchar_t nombre[48]; } Cliente;
+/* ok: el usuario lo aceptó y recibe audio; mientras no, queda esperando. */
+typedef struct { struct sockaddr_in dir; ULONGLONG visto; char id[17]; wchar_t nombre[48]; int ok; } Cliente;
 static Cliente clientes[MAX_CLIENTES];
 static int nclientes = 0;
 static SOCKET g_sock = INVALID_SOCKET;
@@ -152,6 +153,42 @@ static void alias_guardar(void) {
     else RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Alias");
 }
 
+/* Móviles aceptados, por la misma clave que los alias. Un móvil nuevo no recibe audio
+   hasta que el usuario lo acepta; se guardan en el registro. */
+static wchar_t permitidos[MAX_LISTA][24]; static int npermitidos = 0;
+static wchar_t g_preguntando[24] = L"";
+static HWND g_ventana = NULL;
+#define WM_PEDIR (WM_APP + 3)
+
+static int permitido(const wchar_t *clave) {
+    for (int i = 0; i < npermitidos; i++) if (wcscmp(permitidos[i], clave) == 0) return 1;
+    return 0;
+}
+
+static void permitidos_cargar(void) {
+    wchar_t buf[MAX_LISTA * 26]; DWORD t = sizeof buf;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Permitidos", RRF_RT_REG_MULTI_SZ, NULL, buf, &t) != ERROR_SUCCESS) return;
+    for (wchar_t *p = buf; *p && npermitidos < MAX_LISTA; p += wcslen(p) + 1) {
+        wcsncpy(permitidos[npermitidos], p, 23); permitidos[npermitidos][23] = 0;
+        npermitidos++;
+    }
+}
+
+static void permitidos_guardar(void) {
+    wchar_t buf[MAX_LISTA * 26]; size_t k = 0;
+    EnterCriticalSection(&cs);
+    for (int i = 0; i < npermitidos; i++) {
+        size_t l = wcslen(permitidos[i]);
+        memcpy(buf + k, permitidos[i], (l + 1) * sizeof buf[0]);
+        k += l + 1;
+    }
+    int n = npermitidos;
+    LeaveCriticalSection(&cs);
+    buf[k++] = 0;
+    if (n) RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Permitidos", REG_MULTI_SZ, buf, (DWORD)(k * sizeof buf[0]));
+    else RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\AudioWire", L"Permitidos");
+}
+
 /* id y nombre del saludo de una app nueva; una vieja manda solo "SWXH". */
 static void leer_saludo(Cliente *c, const char *b, int n) {
     if (n <= 4) return;
@@ -193,13 +230,17 @@ static int buscar(const struct sockaddr_in *d) {
     return -1;
 }
 
+static int recibe(const Cliente *c) {
+    return c->ok && en_lista(pausados, npausados, c->dir.sin_addr.s_addr) < 0;
+}
+
 static void enviar(const short *pcm, int frames, int conSonido) {
     EnterCriticalSection(&cs);
     ULONGLONG ahora = GetTickCount64();
     purgar(ahora);
     int activos = 0;
     for (int i = 0; i < nclientes; i++)
-        if (en_lista(pausados, npausados, clientes[i].dir.sin_addr.s_addr) < 0) activos++;
+        if (recibe(&clientes[i])) activos++;
     if (activos && g_sock != INVALID_SOCKET) {
         if (conSonido) g_ultimoEnvio = ahora;
         int ch = (int)g_canales, maxF = MAX_DATOS / (ch * 2);
@@ -213,7 +254,7 @@ static void enviar(const short *pcm, int frames, int conSonido) {
             memcpy(paq + 8, &seq, 4);
             memcpy(paq + 12, pcm + (size_t)off * ch, (size_t)f * ch * 2);
             for (int i = 0; i < nclientes; i++)
-                if (en_lista(pausados, npausados, clientes[i].dir.sin_addr.s_addr) < 0)
+                if (recibe(&clientes[i]))
                     sendto(g_sock, paq, 12 + f * ch * 2, 0, (struct sockaddr *)&clientes[i].dir, sizeof clientes[i].dir);
         }
     }
@@ -252,9 +293,10 @@ static DWORD WINAPI hilo_red(LPVOID arg) {
         int bloqueado = en_lista(bloqueados, nbloqueados, ip) >= 0;
         int i = buscar(&de);
         if (b[3] == 'H' && !bloqueado) {
-            if (i >= 0) { clientes[i].visto = ahora; leer_saludo(&clientes[i], b, n); }
+            Cliente *c = NULL;
+            if (i >= 0) { c = &clientes[i]; c->visto = ahora; leer_saludo(c, b, n); }
             else if (nclientes < MAX_CLIENTES) {
-                Cliente *c = &clientes[nclientes++];
+                c = &clientes[nclientes++];
                 c->dir = de; c->visto = ahora; c->id[0] = 0; c->nombre[0] = 0;
                 leer_saludo(c, b, n);
                 if (!nombre_de(ip) && nnombres < MAX_LISTA) {
@@ -263,7 +305,17 @@ static DWORD WINAPI hilo_red(LPVOID arg) {
                     if (t) CloseHandle(t);
                 }
             }
-            sendto(s, "SWXP", 4, 0, (struct sockaddr *)&de, sizeof de);
+            int ok = 1;
+            if (c) {
+                wchar_t clave[24]; clave_de(c->id, ip, clave);
+                c->ok = ok = permitido(clave);
+                /* Se pregunta por un móvil a la vez; los demás esperan su turno. */
+                if (!ok && !g_preguntando[0] && g_ventana) {
+                    wcscpy(g_preguntando, clave);
+                    PostMessageW(g_ventana, WM_PEDIR, 0, (LPARAM)ip);
+                }
+            }
+            sendto(s, ok ? "SWXP" : "SWXW", 4, 0, (struct sockaddr *)&de, sizeof de);
         } else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         LeaveCriticalSection(&cs);
         if (b[3] == 'D' && !bloqueado) {
@@ -646,7 +698,7 @@ static void menu_dispositivos(HMENU m) {
     int n = 0;
     for (int i = 0; i < nclientes; i++) {
         ULONG ip = clientes[i].dir.sin_addr.s_addr;
-        if (en_lista(menuIPs, n, ip) >= 0) continue;
+        if (!clientes[i].ok || en_lista(menuIPs, n, ip) >= 0) continue;
         menuIPs[n] = ip;
         wchar_t ipt[16], nom[48], t[128];
         ip_texto(ip, ipt);
@@ -823,6 +875,37 @@ static void desbloquear(HWND h, int j) {
     actualizar_estado(h);
 }
 
+/* Un móvil nuevo pidió audio: se acepta una vez y queda recordado; si no, queda bloqueado. */
+static void pedir_permiso(HWND h, ULONG ip) {
+    wchar_t clave[24], nom[48], ipt[16], quien[96], msg[260];
+    EnterCriticalSection(&cs);
+    wcscpy(clave, g_preguntando);
+    etiqueta(ip, nom, 48);
+    LeaveCriticalSection(&cs);
+    if (!clave[0]) return;
+    ip_texto(ip, ipt);
+    if (nom[0]) swprintf(quien, 96, L"%ls (%ls)", nom, ipt); else wcscpy(quien, ipt);
+    swprintf(msg, 260, L"¿Dejar que %ls escuche el audio de esta PC?\n\nSi no lo conocés, elegí No y queda bloqueado.", quien);
+    int si = MessageBoxW(h, msg, L"AudioWire", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == IDYES;
+    EnterCriticalSection(&cs);
+    if (si) {
+        if (!permitido(clave) && npermitidos < MAX_LISTA) {
+            wcscpy(permitidos[npermitidos], clave);
+            npermitidos++;
+        }
+    } else {
+        wchar_t claveIp[24]; clave_de(NULL, ip, claveIp);
+        if (nom[0] && !alias_de(claveIp)) alias_poner(claveIp, nom);
+        agregar_a(bloqueados, &nbloqueados, ip);
+        for (int i = 0; i < nclientes;)
+            if (clientes[i].dir.sin_addr.s_addr == ip) clientes[i] = clientes[--nclientes]; else i++;
+    }
+    g_preguntando[0] = 0;
+    LeaveCriticalSection(&cs);
+    if (si) permitidos_guardar(); else { bloqueados_guardar(); alias_guardar(); }
+    actualizar_estado(h);
+}
+
 static void menu_bandeja(HWND h) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, CMD_ABRIR, L"Abrir AudioWire");
@@ -901,7 +984,8 @@ static void actualizar_estado(HWND h) {
 
     EnterCriticalSection(&cs);
     purgar(ahora);
-    int n = nclientes;
+    int n = 0;
+    for (int i = 0; i < nclientes; i++) if (clientes[i].ok) n++;
     int sonando = n > 0 && ahora - g_ultimoEnvio < 1000;
     if (g_rate && wcsncmp(g_disp, L"No ", 3) != 0)
         swprintf(disp, 300, L"%ls  ·  %ld kHz", g_disp, (long)(g_rate / 1000));
@@ -1000,6 +1084,9 @@ static LRESULT CALLBACK ventana(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOSTRAR:
         restaurar(h);
         return 0;
+    case WM_PEDIR:
+        pedir_permiso(h, (ULONG)lp);
+        return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == CMD_ABRIR) restaurar(h);
         else if (LOWORD(wp) == CMD_SALIR) DestroyWindow(h);
@@ -1041,6 +1128,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show) {
     InitializeCriticalSection(&cs);
     bloqueados_cargar();
     alias_cargar();
+    permitidos_cargar();
     timeBeginPeriod(1);
     CreateThread(NULL, 0, hilo_red, NULL, 0, NULL);
     CreateThread(NULL, 0, hilo_captura, NULL, 0, NULL);
@@ -1074,6 +1162,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show) {
     HWND h = CreateWindowExW(0, L"AudioWire", L"AudioWire", estilo,
                              (GetSystemMetrics(SM_CXSCREEN) - ancho) / 2, (GetSystemMetrics(SM_CYSCREEN) - alto) / 2,
                              ancho, alto, NULL, NULL, inst, NULL);
+    g_ventana = h;
     ShowWindow(h, show);
 
     MSG m;
