@@ -21,6 +21,7 @@
 #include "sprites.h"
 
 #define PUERTO 5005
+static gboolean vol_remoto(gpointer p);
 #define MAX_CLIENTES 16
 #define RATE 48000
 #define CANALES 2
@@ -402,7 +403,17 @@ static void *hilo_red(void *arg) {
                     g_idle_add(pedir_permiso, GUINT_TO_POINTER(ip));
                 }
             }
-            sendto(s, ok ? "SWXP" : "SWXW", 4, MSG_DONTWAIT, (struct sockaddr *)&de, sizeof de);
+            /* "SWXP" + volumen actual: un móvil viejo solo mira los 4 primeros bytes. */
+            char r[5] = {'S', 'W', 'X', ok ? 'P' : 'W', (char)g_vol};
+            sendto(s, r, ok ? 5 : 4, MSG_DONTWAIT, (struct sockaddr *)&de, sizeof de);
+        } else if (b[3] == 'V' && n >= 5 && i >= 0 && clientes[i].ok && !bloqueado) {
+            /* "SWXV" + volumen pedido desde el móvil (0..VOL_MAX). */
+            int v = (unsigned char)b[4];
+            if (v > VOL_MAX) v = VOL_MAX;
+            g_vol = v;
+            g_idle_add(vol_remoto, NULL);
+            char r[5] = {'S', 'W', 'X', 'P', (char)v};
+            sendto(s, r, 5, MSG_DONTWAIT, (struct sockaddr *)&de, sizeof de);
         } else if (b[3] == 'O' && i >= 0) clientes[i].opus = 1;
         else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         pthread_mutex_unlock(&mx);
@@ -804,6 +815,14 @@ static void vol_poner(int v, int guardar) {
         redibujar();
     }
     if (guardar) vol_guardar();
+}
+
+/* Un móvil cambió el volumen: se guarda y se redibuja desde el hilo de GTK. */
+static gboolean vol_remoto(gpointer p) {
+    (void)p;
+    vol_guardar();
+    redibujar();
+    return G_SOURCE_REMOVE;
 }
 
 static void alternar_silencio(void) {

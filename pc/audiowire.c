@@ -162,6 +162,7 @@ static wchar_t permitidos[MAX_LISTA][24]; static int npermitidos = 0;
 static wchar_t g_preguntando[24] = L"";
 static HWND g_ventana = NULL;
 #define WM_PEDIR (WM_APP + 3)
+#define WM_VOLREMOTO (WM_APP + 4) /* un móvil cambió el volumen (wp = nuevo valor) */
 
 static int permitido(const wchar_t *clave) {
     for (int i = 0; i < npermitidos; i++) if (wcscmp(permitidos[i], clave) == 0) return 1;
@@ -360,7 +361,17 @@ static DWORD WINAPI hilo_red(LPVOID arg) {
                     PostMessageW(g_ventana, WM_PEDIR, 0, (LPARAM)ip);
                 }
             }
-            sendto(s, ok ? "SWXP" : "SWXW", 4, 0, (struct sockaddr *)&de, sizeof de);
+            /* "SWXP" + volumen actual: un móvil viejo solo mira los 4 primeros bytes. */
+            char r[5] = {'S', 'W', 'X', ok ? 'P' : 'W', (char)g_vol};
+            sendto(s, r, ok ? 5 : 4, 0, (struct sockaddr *)&de, sizeof de);
+        } else if (b[3] == 'V' && n >= 5 && i >= 0 && clientes[i].ok && !bloqueado) {
+            /* "SWXV" + volumen pedido desde el móvil (0..VOL_MAX). */
+            int v = (unsigned char)b[4];
+            if (v > VOL_MAX) v = VOL_MAX;
+            g_vol = v;
+            if (g_ventana) PostMessageW(g_ventana, WM_VOLREMOTO, (WPARAM)v, 0);
+            char r[5] = {'S', 'W', 'X', 'P', (char)v};
+            sendto(s, r, 5, 0, (struct sockaddr *)&de, sizeof de);
         } else if (b[3] == 'O' && i >= 0) clientes[i].opus = 1;
         else if (b[3] == 'B' && i >= 0) clientes[i] = clientes[--nclientes];
         LeaveCriticalSection(&cs);
@@ -1132,6 +1143,10 @@ static LRESULT CALLBACK ventana(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_PEDIR:
         pedir_permiso(h, (ULONG)lp);
+        return 0;
+    case WM_VOLREMOTO:
+        vol_guardar();
+        InvalidateRect(h, NULL, FALSE);
         return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == CMD_ABRIR) restaurar(h);

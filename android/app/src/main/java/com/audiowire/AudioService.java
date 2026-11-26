@@ -33,6 +33,7 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.SocketTimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class AudioService extends Service {
 
@@ -47,6 +48,10 @@ public class AudioService extends Service {
     public static volatile String estado = "Desconectado";
     public static volatile boolean activo = false;
     public static volatile String nombrePc = null;
+    /* Volumen de AudioWire en el PC (0..150), o -1 si el PC es viejo y no lo informa. */
+    public static volatile int volPc = -1;
+    /* Volumen que la pantalla pide mandar al PC, o -1 si no hay nada pendiente. */
+    public static final AtomicInteger volPedido = new AtomicInteger(-1);
 
     private AtomicBoolean vivo;
     private Thread hilo;
@@ -281,6 +286,8 @@ public class AudioService extends Service {
     private void bucle(String ip, String quien, AtomicBoolean vivo) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
         estado = "Conectando a " + quien + "…";
+        volPc = -1;
+        volPedido.set(-1);
         DatagramSocket s = null;
         AudioTrack pista = null;
         MediaCodec dec = null;
@@ -309,6 +316,13 @@ public class AudioService extends Service {
                     } catch (IOException ignored) { }
                     ultimoHola = ahora;
                 }
+                int v = volPedido.getAndSet(-1);
+                if (v >= 0) {
+                    byte[] pedido = {'S', 'W', 'X', 'V', (byte) v};
+                    try {
+                        s.send(new DatagramPacket(pedido, pedido.length, dir, PUERTO));
+                    } catch (IOException ignored) { }
+                }
                 if (ahora - ultimoEstado >= 250) {
                     ultimoEstado = ahora;
                     if (ultimaRespuesta == 0) estado = "Conectando a " + quien + "…";
@@ -333,6 +347,8 @@ public class AudioService extends Service {
                 if (buf[2] == 'X' && buf[3] == 'P') {
                     ultimaRespuesta = ahora;
                     ultimaEspera = 0;
+                    /* Un PC nuevo agrega su volumen; uno viejo manda solo "SWXP". */
+                    if (n >= 5) volPc = buf[4] & 0xFF;
                     continue;
                 }
                 if (buf[2] == 'X' && buf[3] == 'W') {
@@ -393,6 +409,7 @@ public class AudioService extends Service {
         } catch (Exception e) {
             estado = "Error: " + (e.getMessage() != null ? e.getMessage() : "desconocido");
         } finally {
+            volPc = -1;
             if (s != null) {
                 try {
                     s.send(new DatagramPacket(ADIOS, ADIOS.length, InetAddress.getByName(ip), PUERTO));

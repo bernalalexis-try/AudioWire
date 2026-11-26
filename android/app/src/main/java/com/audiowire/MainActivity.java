@@ -17,6 +17,7 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -41,6 +42,11 @@ public class MainActivity extends Activity {
     private TextView textoEstado, textoBusqueda;
     private LinearLayout listaPcs, filaManual;
     private EditText campoIp;
+    private LinearLayout filaVol;
+    private TextView textoVol;
+    private SeekBar barraVol;
+    private boolean tocandoVol = false;
+    private long ultimoToqueVol = 0;
     private SharedPreferences prefs;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -84,6 +90,39 @@ public class MainActivity extends Activity {
             }
         });
         layout.addView(boton);
+
+        /* Volumen de AudioWire en el PC: solo aparece si el PC lo informa (versiones nuevas). */
+        filaVol = new LinearLayout(this);
+        filaVol.setOrientation(LinearLayout.VERTICAL);
+        filaVol.setPadding(0, dp(12), 0, dp(4));
+        filaVol.setVisibility(View.GONE);
+        textoVol = new TextView(this);
+        textoVol.setTextSize(15f);
+        filaVol.addView(textoVol);
+        barraVol = new SeekBar(this);
+        barraVol.setMax(150);
+        barraVol.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar b, int v, boolean delUsuario) {
+                if (!delUsuario) return;
+                AudioService.volPedido.set(v);
+                ultimoToqueVol = SystemClock.elapsedRealtime();
+                textoVol.setText(textoVolumen(v));
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar b) {
+                tocandoVol = true;
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar b) {
+                tocandoVol = false;
+                ultimoToqueVol = SystemClock.elapsedRealtime();
+            }
+        });
+        filaVol.addView(barraVol);
+        layout.addView(filaVol);
 
         textoBusqueda = new TextView(this);
         textoBusqueda.setTextSize(15f);
@@ -300,6 +339,10 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static String textoVolumen(int v) {
+        return "Volumen en el PC: " + v + " %";
+    }
+
     private void actualizar() {
         boolean activo = AudioService.activo;
         if (activo) {
@@ -308,7 +351,15 @@ public class MainActivity extends Activity {
             boton.setText("Desconectar");
             boton.setVisibility(View.VISIBLE);
             textoBusqueda.setVisibility(View.GONE);
+            int vol = AudioService.volPc;
+            filaVol.setVisibility(vol >= 0 ? View.VISIBLE : View.GONE);
+            /* Mientras la mueve (y un rato después) manda la barra, no lo que diga el PC. */
+            if (vol >= 0 && !tocandoVol && SystemClock.elapsedRealtime() - ultimoToqueVol > 1500) {
+                barraVol.setProgress(vol);
+                textoVol.setText(textoVolumen(vol));
+            }
         } else {
+            filaVol.setVisibility(View.GONE);
             iniciarBusqueda();
             intentarAutoConexion();
             if (AudioService.activo) return;
